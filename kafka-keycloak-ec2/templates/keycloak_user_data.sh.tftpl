@@ -84,6 +84,10 @@ for i in {1..60}; do
   sleep 2
 done
 
+# Verify the management interface too. Metrics and health are exposed on 9000.
+curl -fsS "http://127.0.0.1:9000/health/ready" || true
+curl -fsS "http://127.0.0.1:9000/metrics" | head -20 || true
+
 docker compose ps
 docker compose logs --tail=100 || true
 

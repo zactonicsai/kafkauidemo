@@ -238,6 +238,16 @@ resource "aws_security_group" "keycloak" {
     security_groups = [aws_security_group.kafka.id]
   }
 
+  # Lab-only access to Keycloak management endpoints. Keep this restricted to
+  # allowed_cidr; Keycloak recommends not exposing port 9000 broadly.
+  ingress {
+    description = "Keycloak health and metrics from allowed client network"
+    from_port   = 9000
+    to_port     = 9000
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_cidr]
+  }
+
   egress {
     description = "Outbound Internet access for packages and images"
     from_port   = 0
@@ -557,6 +567,16 @@ output "keycloak_url" {
 output "keycloak_admin_url" {
   value       = "http://${aws_eip.keycloak.public_ip}:8081/admin/"
   description = "Keycloak Admin Console."
+}
+
+output "keycloak_metrics_url" {
+  value       = "http://${aws_eip.keycloak.public_ip}:9000/metrics"
+  description = "Keycloak metrics endpoint. Restricted by allowed_cidr."
+}
+
+output "keycloak_health_url" {
+  value       = "http://${aws_eip.keycloak.public_ip}:9000/health/ready"
+  description = "Keycloak readiness endpoint. Restricted by allowed_cidr."
 }
 
 output "kafka_ui_username" {

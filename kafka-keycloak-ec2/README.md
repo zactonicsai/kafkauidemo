@@ -1601,3 +1601,148 @@ Then watch the bootstrap log through SSM:
 ```bash
 sudo tail -f /var/log/keycloak-bootstrap.log
 ```
+
+# Kafka UI `/config.yml` Permission Denied
+
+If Kafka UI repeatedly restarts with an error like:
+
+```text
+java.io.FileNotFoundException: /config.yml (Permission denied)
+```
+
+Docker is working. The problem is the **host file permissions** on the bind-mounted Kafka UI configuration.
+
+Kafka UI runs as a non-root user. The file:
+
+```text
+/opt/kafka-stack/kafka-ui.yml
+```
+
+must be readable by that container user. The bootstrap now creates it as:
+
+```bash
+chmod 644 /opt/kafka-stack/kafka-ui.yml
+```
+
+For an already-created Kafka EC2, repair it with:
+
+```bash
+sudo chmod 644 /opt/kafka-stack/kafka-ui.yml
+cd /opt/kafka-stack
+sudo docker compose restart kafka-ui
+sudo docker compose logs --tail=100 kafka-ui
+```
+
+Verify from inside the container:
+
+```bash
+sudo docker exec kafka-ui sh -c 'id; ls -l /config.yml; head -5 /config.yml'
+```
+
+The file should be readable. Do **not** fix this by running Kafka UI as root unless you have a specific reason.
+
+# Keycloak HTTP, Health, and Metrics
+
+This lab explicitly enables Keycloak HTTP for the browser/OIDC endpoints and enables the Keycloak management interface for health and metrics.
+
+Main Keycloak HTTP listener:
+
+```text
+EC2 TCP 8081 -> container TCP 8080
+```
+
+Keycloak management interface:
+
+```text
+EC2 TCP 9000 -> container TCP 9000
+```
+
+The Compose environment includes:
+
+```yaml
+KC_HTTP_ENABLED: "true"
+KC_HTTP_HOST: "0.0.0.0"
+KC_HTTP_PORT: "8080"
+KC_HEALTH_ENABLED: "true"
+KC_METRICS_ENABLED: "true"
+KC_HTTP_MANAGEMENT_SCHEME: "http"
+KC_HTTP_MANAGEMENT_HOST: "0.0.0.0"
+KC_HTTP_MANAGEMENT_PORT: "9000"
+```
+
+Keycloak 26 exposes health and metrics on the management interface, which uses port `9000` by default when enabled.
+
+## Test Keycloak HTTP locally
+
+On the Keycloak EC2:
+
+```bash
+curl -i http://127.0.0.1:8081/
+```
+
+Test the realm discovery endpoint:
+
+```bash
+curl -s \
+  http://127.0.0.1:8081/realms/kafka-ui/.well-known/openid-configuration
+```
+
+## Test Keycloak readiness
+
+```bash
+curl -i http://127.0.0.1:9000/health/ready
+```
+
+Also useful:
+
+```bash
+curl -i http://127.0.0.1:9000/health/live
+curl -i http://127.0.0.1:9000/health/started
+```
+
+## Test Keycloak metrics
+
+```bash
+curl http://127.0.0.1:9000/metrics | head -50
+```
+
+From your workstation, when your address is included in `allowed_cidr`:
+
+```bash
+terraform output -raw keycloak_metrics_url
+terraform output -raw keycloak_health_url
+```
+
+Then:
+
+```bash
+curl "$(terraform output -raw keycloak_health_url)"
+curl "$(terraform output -raw keycloak_metrics_url)" | head -50
+```
+
+## Security note about port 9000
+
+The Terraform security group permits port `9000` **only from `allowed_cidr`**. Do not normally open Keycloak's management port to `0.0.0.0/0`. Health and metrics can reveal useful internal information. For a production design, keep port 9000 private and have Prometheus or your monitoring system reach it over the VPC.
+
+## Check published ports
+
+On the Keycloak EC2:
+
+```bash
+sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+```
+
+You should see mappings similar to:
+
+```text
+0.0.0.0:8081->8080/tcp
+0.0.0.0:9000->9000/tcp
+```
+
+And on the host:
+
+```bash
+sudo ss -lntp | egrep ':8081|:9000'
+```
+
+If `127.0.0.1:8081` works but the public `:8081` URL does not, troubleshoot the EC2 security group, route table, Internet Gateway, and Elastic IP association. If `127.0.0.1:9000` works but the public metrics URL does not, check the security-group `9000` rule and `allowed_cidr`.

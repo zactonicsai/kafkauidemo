@@ -12,10 +12,23 @@ services:
       KC_BOOTSTRAP_ADMIN_PASSWORD: "${keycloak_admin_password}"
       KC_HOSTNAME: "http://${keycloak_public_ip}:8081"
       KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      # Explicitly enable the main HTTP listener used for OIDC/Admin UI.
       KC_HTTP_ENABLED: "true"
+      KC_HTTP_HOST: "0.0.0.0"
+      KC_HTTP_PORT: "8080"
+
+      # Enable Keycloak observability endpoints on the management interface.
+      # Keycloak 26 uses port 9000 for health and metrics by default.
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_HTTP_MANAGEMENT_SCHEME: "http"
+      KC_HTTP_MANAGEMENT_HOST: "0.0.0.0"
+      KC_HTTP_MANAGEMENT_PORT: "9000"
+
       JAVA_OPTS_KC_HEAP: "-XX:InitialRAMPercentage=20 -XX:MaxRAMPercentage=60"
     ports:
       - "0.0.0.0:8081:8080"
+      - "0.0.0.0:9000:9000"
     volumes:
       # Bind the H2 data directory to a host path that user-data owns as UID 1000.
       # The official Keycloak container runs as UID 1000, so this avoids H2

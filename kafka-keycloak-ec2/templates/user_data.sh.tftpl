@@ -33,7 +33,9 @@ docker compose version
 echo '${docker_compose_b64}' | base64 -d > "$STACK_DIR/docker-compose.yml"
 echo '${kafka_ui_config_b64}' | base64 -d > "$STACK_DIR/kafka-ui.yml"
 chmod 644 "$STACK_DIR/docker-compose.yml"
-chmod 600 "$STACK_DIR/kafka-ui.yml"
+# Kafka UI runs as a non-root user in the container. The bind-mounted file
+# must therefore be readable by that user. 0644 is intentional for this lab.
+chmod 644 "$STACK_DIR/kafka-ui.yml"
 
 cd "$STACK_DIR"
 docker compose config
