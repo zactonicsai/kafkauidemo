@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars and edit.
+
+aws_region   = "us-east-1"
+project_name = "kafka-keycloak-lab"
+
+# Kafka + Kafka UI need more memory than Keycloak alone.
+kafka_instance_type    = "t3.medium"
+keycloak_instance_type = "t3.small"
+
+# Recommended: your public IPv4 address /32.
+# Example only; do not use 203.0.113.10 literally.
+#allowed_cidr = "203.0.113.10/32"
+
+# Easy lab option, but public to the Internet:
+allowed_cidr = "0.0.0.0/0"
+
+kafka_ui_username       = "kafkauser"
+keycloak_admin_username = "admin"

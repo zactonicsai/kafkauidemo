@@ -16,16 +16,16 @@
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
-      "rootUrl": "http://${public_ip}:8080",
-      "baseUrl": "http://${public_ip}:8080",
+      "rootUrl": "http://${kafka_public_ip}:8080",
+      "baseUrl": "http://${kafka_public_ip}:8080",
       "redirectUris": [
-        "http://${public_ip}:8080/login/oauth2/code/keycloak"
+        "http://${kafka_public_ip}:8080/login/oauth2/code/keycloak"
       ],
       "webOrigins": [
-        "http://${public_ip}:8080"
+        "http://${kafka_public_ip}:8080"
       ],
       "attributes": {
-        "post.logout.redirect.uris": "http://${public_ip}:8080/*"
+        "post.logout.redirect.uris": "http://${kafka_public_ip}:8080/*"
       }
     }
   ],

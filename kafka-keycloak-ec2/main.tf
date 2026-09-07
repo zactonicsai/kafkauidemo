@@ -34,14 +34,20 @@ variable "project_name" {
   default     = "kafka-keycloak-lab"
 }
 
-variable "instance_type" {
-  description = "EC2 size. t3.medium is a reasonable minimum for Kafka + Kafka UI + Keycloak on one host."
+variable "kafka_instance_type" {
+  description = "EC2 size for Kafka + Kafka UI."
   type        = string
   default     = "t3.medium"
 }
 
+variable "keycloak_instance_type" {
+  description = "EC2 size for Keycloak. t3.small is fine for this lab."
+  type        = string
+  default     = "t3.small"
+}
+
 variable "allowed_cidr" {
-  description = "IPv4 CIDR allowed to open Kafka UI and Keycloak. For a lab 0.0.0.0/0 works, but YOUR_PUBLIC_IP/32 is safer."
+  description = "IPv4 CIDR allowed to open Kafka UI and Keycloak. YOUR_PUBLIC_IP/32 is recommended."
   type        = string
   default     = "0.0.0.0/0"
 }
@@ -62,19 +68,49 @@ variable "keycloak_admin_username" {
 # CURRENT AMAZON LINUX 2023 AMI
 ###############################################################################
 
-# AWS maintains this SSM public parameter, so an AMI ID does not need to be
-# hard-coded in this Terraform configuration.
 data "aws_ssm_parameter" "al2023" {
   name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 }
 
 ###############################################################################
-# RANDOM LAB PASSWORDS
+# FIND AN AVAILABILITY ZONE THAT SUPPORTS BOTH INSTANCE TYPES
+#
+# Do not let AWS randomly choose the subnet AZ. Some EC2 instance types are
+# not offered in every Availability Zone. We ask EC2 which AZs support each
+# requested size, then select the first AZ common to both lists.
 ###############################################################################
 
-# Alphanumeric values keep the generated JSON/YAML and shell bootstrapping
-# simple. These values still end up in Terraform state, so this is a LAB
-# pattern, not a production secret-management design.
+data "aws_ec2_instance_type_offerings" "kafka" {
+  filter {
+    name   = "instance-type"
+    values = [var.kafka_instance_type]
+  }
+
+  location_type = "availability-zone"
+}
+
+data "aws_ec2_instance_type_offerings" "keycloak" {
+  filter {
+    name   = "instance-type"
+    values = [var.keycloak_instance_type]
+  }
+
+  location_type = "availability-zone"
+}
+
+locals {
+  common_instance_azs = sort(tolist(setintersection(
+    toset(data.aws_ec2_instance_type_offerings.kafka.locations),
+    toset(data.aws_ec2_instance_type_offerings.keycloak.locations)
+  )))
+
+  selected_availability_zone = try(local.common_instance_azs[0], null)
+}
+
+###############################################################################
+# RANDOM LAB PASSWORDS / OIDC SECRET
+###############################################################################
+
 resource "random_password" "keycloak_admin" {
   length  = 24
   special = false
@@ -115,7 +151,15 @@ resource "aws_internet_gateway" "main" {
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.40.1.0/24"
+  availability_zone       = local.selected_availability_zone
   map_public_ip_on_launch = true
+
+  lifecycle {
+    precondition {
+      condition     = local.selected_availability_zone != null
+      error_message = "No Availability Zone in ${var.aws_region} supports both ${var.kafka_instance_type} and ${var.keycloak_instance_type}. Choose different instance types."
+    }
+  }
 
   tags = {
     Name = "${var.project_name}-public-subnet"
@@ -141,37 +185,25 @@ resource "aws_route_table_association" "public" {
 }
 
 ###############################################################################
-# SECURITY GROUP
+# SECURITY GROUPS
 ###############################################################################
 
-resource "aws_security_group" "stack" {
-  name_prefix = "${var.project_name}-"
-  description = "Kafka UI and Keycloak lab access"
+# Kafka host: only Kafka UI is public. Kafka itself remains inside Docker.
+resource "aws_security_group" "kafka" {
+  name_prefix = "${var.project_name}-kafka-"
+  description = "Kafka and Kafka UI EC2 access"
   vpc_id      = aws_vpc.main.id
 
-  # Kafka UI
   ingress {
-    description = "Kafka UI"
+    description = "Kafka UI from allowed client network"
     from_port   = 8080
     to_port     = 8080
     protocol    = "tcp"
     cidr_blocks = [var.allowed_cidr]
   }
 
-  # Keycloak web/admin console
-  ingress {
-    description = "Keycloak"
-    from_port   = 8081
-    to_port     = 8081
-    protocol    = "tcp"
-    cidr_blocks = [var.allowed_cidr]
-  }
-
-  # Kafka port 9092 is intentionally NOT exposed publicly.
-  # Kafka UI reaches Kafka through Docker's private bridge network.
-
   egress {
-    description = "Allow outbound Internet access for package/image downloads"
+    description = "Outbound access for packages, images, and Keycloak OIDC"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -179,7 +211,43 @@ resource "aws_security_group" "stack" {
   }
 
   tags = {
-    Name = "${var.project_name}-sg"
+    Name = "${var.project_name}-kafka-sg"
+  }
+}
+
+# Keycloak host: browser access is limited to allowed_cidr. Kafka UI is also
+# explicitly allowed to reach Keycloak over the VPC private network.
+resource "aws_security_group" "keycloak" {
+  name_prefix = "${var.project_name}-keycloak-"
+  description = "Keycloak EC2 access"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "Keycloak browser/admin access"
+    from_port   = 8081
+    to_port     = 8081
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_cidr]
+  }
+
+  ingress {
+    description     = "Kafka UI private OIDC back-channel"
+    from_port       = 8081
+    to_port         = 8081
+    protocol        = "tcp"
+    security_groups = [aws_security_group.kafka.id]
+  }
+
+  egress {
+    description = "Outbound Internet access for packages and images"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.project_name}-keycloak-sg"
   }
 }
 
@@ -215,69 +283,169 @@ resource "aws_iam_instance_profile" "ec2" {
 }
 
 ###############################################################################
-# STABLE PUBLIC IP
+# STABLE PUBLIC IPS
 ###############################################################################
 
-# OAuth callback URLs must match. An Elastic IP gives this lab a stable address
-# even if the EC2 instance is stopped and started.
-resource "aws_eip" "stack" {
+resource "aws_eip" "kafka" {
   domain = "vpc"
 
   tags = {
-    Name = "${var.project_name}-eip"
+    Name = "${var.project_name}-kafka-eip"
+  }
+}
+
+resource "aws_eip" "keycloak" {
+  domain = "vpc"
+
+  tags = {
+    Name = "${var.project_name}-keycloak-eip"
   }
 }
 
 ###############################################################################
-# CONFIG FILES RENDERED INTO EC2 USER DATA
+# CONFIGURATION RENDERED INTO EACH EC2 USER-DATA SCRIPT
 ###############################################################################
 
 locals {
-  docker_compose = templatefile("${path.module}/files/docker-compose.yml.tftpl", {
-    public_ip                  = aws_eip.stack.public_ip
-    keycloak_admin_username   = var.keycloak_admin_username
-    keycloak_admin_password   = random_password.keycloak_admin.result
-  })
-
+  # Keycloak realm contains the Kafka UI OIDC client and demo user.
   keycloak_realm = templatefile("${path.module}/files/keycloak-realm.json.tftpl", {
-    public_ip          = aws_eip.stack.public_ip
-    kafka_ui_username  = var.kafka_ui_username
-    kafka_ui_password  = random_password.kafka_ui_user.result
-    kafka_ui_secret    = random_password.kafka_ui_client_secret.result
+    kafka_public_ip  = aws_eip.kafka.public_ip
+    kafka_ui_username = var.kafka_ui_username
+    kafka_ui_password = random_password.kafka_ui_user.result
+    kafka_ui_secret   = random_password.kafka_ui_client_secret.result
   })
 
+  # Kafka UI uses the public Keycloak address for browser authorization and the
+  # Keycloak EC2 private address for server-to-server token/JWK/userinfo calls.
   kafka_ui_config = templatefile("${path.module}/files/kafka-ui.yml.tftpl", {
-    public_ip       = aws_eip.stack.public_ip
-    kafka_ui_secret = random_password.kafka_ui_client_secret.result
+    kafka_public_ip          = aws_eip.kafka.public_ip
+    keycloak_public_ip       = aws_eip.keycloak.public_ip
+    keycloak_private_ip      = aws_instance.keycloak.private_ip
+    kafka_ui_secret          = random_password.kafka_ui_client_secret.result
   })
 
-  user_data = templatefile("${path.module}/templates/user_data.sh.tftpl", {
-    docker_compose_b64 = base64encode(local.docker_compose)
-    keycloak_realm_b64 = base64encode(local.keycloak_realm)
+  kafka_compose = templatefile("${path.module}/files/docker-compose.yml.tftpl", {})
+
+  keycloak_compose = templatefile("${path.module}/files/keycloak-compose.yml.tftpl", {
+    keycloak_public_ip       = aws_eip.keycloak.public_ip
+    keycloak_admin_username  = var.keycloak_admin_username
+    keycloak_admin_password  = random_password.keycloak_admin.result
+  })
+
+  kafka_user_data = templatefile("${path.module}/templates/user_data.sh.tftpl", {
+    docker_compose_b64  = base64encode(local.kafka_compose)
     kafka_ui_config_b64 = base64encode(local.kafka_ui_config)
+  })
+
+  keycloak_user_data = templatefile("${path.module}/templates/keycloak_user_data.sh.tftpl", {
+    keycloak_compose_b64 = base64encode(local.keycloak_compose)
+    keycloak_realm_b64   = base64encode(local.keycloak_realm)
   })
 }
 
 ###############################################################################
-# EC2 LAUNCH TEMPLATE
+# KEYCLOAK LAUNCH TEMPLATE + EC2
 ###############################################################################
 
-# Keep the EC2 definition in a Launch Template.  This makes the machine setup
-# reusable later if you decide to put it behind an Auto Scaling Group.
-resource "aws_launch_template" "stack" {
-  name_prefix            = "${var.project_name}-"
+resource "aws_launch_template" "keycloak" {
+  name_prefix            = "${var.project_name}-keycloak-"
   image_id               = data.aws_ssm_parameter.al2023.value
-  instance_type          = var.instance_type
+  instance_type          = var.keycloak_instance_type
   update_default_version = true
 
   iam_instance_profile {
     name = aws_iam_instance_profile.ec2.name
   }
 
-  vpc_security_group_ids = [aws_security_group.stack.id]
+  network_interfaces {
+    device_index                = 0
+    associate_public_ip_address = true
+    delete_on_termination       = true
+    subnet_id                   = aws_subnet.public.id
+    security_groups             = [aws_security_group.keycloak.id]
+  }
 
-  # Launch Templates expect user_data to already be base64 encoded.
-  user_data = base64encode(local.user_data)
+  user_data = base64encode(local.keycloak_user_data)
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+
+    ebs {
+      volume_type           = "gp3"
+      volume_size           = 20
+      encrypted             = true
+      delete_on_termination = true
+    }
+  }
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "${var.project_name}-keycloak-ec2"
+    }
+  }
+
+  tag_specifications {
+    resource_type = "volume"
+    tags = {
+      Name = "${var.project_name}-keycloak-root"
+    }
+  }
+
+  tags = {
+    Name = "${var.project_name}-keycloak-launch-template"
+  }
+}
+
+resource "aws_instance" "keycloak" {
+  launch_template {
+    id      = aws_launch_template.keycloak.id
+    version = tostring(aws_launch_template.keycloak.latest_version)
+  }
+
+  tags = {
+    Name = "${var.project_name}-keycloak-ec2"
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.ssm,
+    aws_route_table_association.public
+  ]
+}
+
+resource "aws_eip_association" "keycloak" {
+  instance_id   = aws_instance.keycloak.id
+  allocation_id = aws_eip.keycloak.id
+}
+
+###############################################################################
+# KAFKA + KAFKA UI LAUNCH TEMPLATE + EC2
+###############################################################################
+
+resource "aws_launch_template" "kafka" {
+  name_prefix            = "${var.project_name}-kafka-"
+  image_id               = data.aws_ssm_parameter.al2023.value
+  instance_type          = var.kafka_instance_type
+  update_default_version = true
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ec2.name
+  }
+
+  network_interfaces {
+    device_index                = 0
+    associate_public_ip_address = true
+    delete_on_termination       = true
+    subnet_id                   = aws_subnet.public.id
+    security_groups             = [aws_security_group.kafka.id]
+  }
+
+  user_data = base64encode(local.kafka_user_data)
 
   block_device_mappings {
     device_name = "/dev/xvda"
@@ -297,87 +465,97 @@ resource "aws_launch_template" "stack" {
 
   tag_specifications {
     resource_type = "instance"
-
     tags = {
-      Name = "${var.project_name}-ec2"
+      Name = "${var.project_name}-kafka-ec2"
     }
   }
 
   tag_specifications {
     resource_type = "volume"
-
     tags = {
-      Name = "${var.project_name}-root-volume"
+      Name = "${var.project_name}-kafka-root"
     }
   }
 
   tags = {
-    Name = "${var.project_name}-launch-template"
+    Name = "${var.project_name}-kafka-launch-template"
   }
 }
 
-###############################################################################
-# EC2 INSTANCE FROM THE LAUNCH TEMPLATE
-###############################################################################
-
-resource "aws_instance" "stack" {
-  subnet_id                   = aws_subnet.public.id
- # associate_public_ip_address = true
-
+resource "aws_instance" "kafka" {
   launch_template {
-    id      = aws_launch_template.stack.id
-    version = tostring(aws_launch_template.stack.latest_version)
+    id      = aws_launch_template.kafka.id
+    version = tostring(aws_launch_template.kafka.latest_version)
   }
 
-  # Changing the Launch Template creates a new LT version.  Referencing the
-  # numeric latest_version here makes Terraform replace the EC2 instance so the
-  # new boot configuration is actually applied.
   tags = {
-    Name = "${var.project_name}-ec2"
+    Name = "${var.project_name}-kafka-ec2"
   }
 
   depends_on = [
     aws_iam_role_policy_attachment.ssm,
-    aws_route_table_association.public
+    aws_route_table_association.public,
+    aws_instance.keycloak,
+    aws_eip_association.keycloak
   ]
 }
 
-resource "aws_eip_association" "stack" {
-  instance_id   = aws_instance.stack.id
-  allocation_id = aws_eip.stack.id
+resource "aws_eip_association" "kafka" {
+  instance_id   = aws_instance.kafka.id
+  allocation_id = aws_eip.kafka.id
 }
 
 ###############################################################################
 # OUTPUTS
 ###############################################################################
 
-output "launch_template_id" {
-  value       = aws_launch_template.stack.id
-  description = "EC2 Launch Template used by the lab instance."
+output "selected_availability_zone" {
+  value       = local.selected_availability_zone
+  description = "Availability Zone selected because it supports both configured EC2 instance types."
 }
 
-output "instance_id" {
-  value       = aws_instance.stack.id
-  description = "EC2 instance created from the Launch Template."
+output "supported_common_availability_zones" {
+  value       = local.common_instance_azs
+  description = "Availability Zones that support both Kafka and Keycloak instance types."
 }
 
-output "public_ip" {
-  value       = aws_eip.stack.public_ip
-  description = "Stable public IPv4 address for this lab."
+output "kafka_instance_id" {
+  value       = aws_instance.kafka.id
+  description = "EC2 instance running Kafka and Kafka UI."
+}
+
+output "keycloak_instance_id" {
+  value       = aws_instance.keycloak.id
+  description = "EC2 instance running Keycloak."
+}
+
+output "kafka_public_ip" {
+  value       = aws_eip.kafka.public_ip
+  description = "Stable public IPv4 address for Kafka UI."
+}
+
+output "keycloak_public_ip" {
+  value       = aws_eip.keycloak.public_ip
+  description = "Stable public IPv4 address for Keycloak."
+}
+
+output "keycloak_private_ip" {
+  value       = aws_instance.keycloak.private_ip
+  description = "Private VPC address used by Kafka UI for OIDC back-channel calls."
 }
 
 output "kafka_ui_url" {
-  value       = "http://${aws_eip.stack.public_ip}:8080"
-  description = "Open this URL to use Kafka UI. Keycloak should handle login."
+  value       = "http://${aws_eip.kafka.public_ip}:8080"
+  description = "Kafka UI URL. Keycloak handles login."
 }
 
 output "keycloak_url" {
-  value       = "http://${aws_eip.stack.public_ip}:8081"
+  value       = "http://${aws_eip.keycloak.public_ip}:8081"
   description = "Keycloak base URL."
 }
 
 output "keycloak_admin_url" {
-  value       = "http://${aws_eip.stack.public_ip}:8081/admin/"
+  value       = "http://${aws_eip.keycloak.public_ip}:8081/admin/"
   description = "Keycloak Admin Console."
 }
 
@@ -403,7 +581,12 @@ output "keycloak_admin_password" {
   description = "Generated Keycloak administrator password."
 }
 
-output "ssm_start_session" {
-  value       = "aws ssm start-session --region ${var.aws_region} --target ${aws_instance.stack.id}"
-  description = "Connect without opening SSH port 22."
+output "ssm_kafka" {
+  value       = "aws ssm start-session --region ${var.aws_region} --target ${aws_instance.kafka.id}"
+  description = "SSM command for Kafka/Kafka UI EC2."
+}
+
+output "ssm_keycloak" {
+  value       = "aws ssm start-session --region ${var.aws_region} --target ${aws_instance.keycloak.id}"
+  description = "SSM command for Keycloak EC2."
 }

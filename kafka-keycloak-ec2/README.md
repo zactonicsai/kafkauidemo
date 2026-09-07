@@ -1,448 +1,1315 @@
-# Kafka + Kafka UI + Keycloak on One AWS EC2 Instance
+# Kafka + Kafka UI + Keycloak on Two EC2 Instances
 
-This project creates a **simple learning/lab environment** on AWS using Terraform.
+This project creates a small AWS lab where **Keycloak runs on its own EC2 instance** and **Kafka + Kafka UI run on a second EC2 instance**.
 
-It builds one EC2 instance and then Docker Compose starts:
-
-- **Apache Kafka 4.3.1** in single-node KRaft mode
-- **Kafbat Kafka UI v1.5.0**
-- **Keycloak 26.7.3**
-- A Keycloak realm named **`kafka-ui`**
-- A Keycloak OpenID Connect client named **`kafka-ui`**
-- A demo Keycloak user named **`kafkauser`** by default
-- OAuth2 login from Kafka UI to Keycloak
-
-The important idea is:
-
-```text
-Your Browser
-     |
-     | HTTP :8080
-     v
-+-------------------+
-| Kafka UI          |
-| Kafbat UI         |
-+---------+---------+
-          |
-          | OAuth2 / OpenID Connect login
-          v
-+-------------------+
-| Keycloak          |
-| HTTP :8081        |
-| realm: kafka-ui   |
-| user: kafkauser   |
-+-------------------+
-
-Inside the EC2 Docker network:
-
-+-------------------+       PLAINTEXT :9092       +-------------------+
-| Kafka UI          | --------------------------> | Apache Kafka      |
-+-------------------+                             | single-node KRaft |
-                                                  +-------------------+
-```
-
-Kafka port `9092` is **not opened to the Internet**. Kafka UI talks to Kafka through Docker's private bridge network.
+The split is intentional. Kafka and Keycloak are both Java applications and can compete for memory when they share one small EC2 instance. Giving Keycloak its own EC2 makes Docker restarts and memory troubleshooting much easier.
 
 ---
 
-# 1. What this project is for
+## 1. Architecture
 
-This is a good setup for:
+```text
+                         Your browser
+                             |
+              +--------------+--------------+
+              |                             |
+              | TCP 8080                    | TCP 8081
+              v                             v
+     +--------------------+        +--------------------+
+     | Kafka EC2          |        | Keycloak EC2       |
+     |                    |        |                    |
+     | Elastic IP #1      |        | Elastic IP #2      |
+     |                    |        |                    |
+     | Docker             |        | Docker             |
+     |  + Kafka           |        |  + Keycloak        |
+     |  + Kafka UI        |        |                    |
+     +---------+----------+        +----------+---------+
+               |                              ^
+               | OIDC token/JWK/userinfo      |
+               | private VPC TCP 8081         |
+               +------------------------------+
+```
 
-- Learning Kafka
-- Learning Kafka UI
-- Testing Keycloak authentication
-- Trying OAuth2 / OpenID Connect
-- Creating topics and messages from a browser
-- Testing Terraform + EC2 + Docker Compose
+### Public traffic
 
-This is **not a production architecture**.
+- Kafka UI: `http://KAFKA_EIP:8080`
+- Keycloak: `http://KEYCLOAK_EIP:8081`
+- Kafka port `9092` is **not opened to the Internet**.
+- SSH port `22` is **not opened**.
+- EC2 administration is done through AWS Systems Manager Session Manager.
 
-The lab intentionally uses:
+### Private traffic
 
-- One EC2 server
-- One Kafka broker/controller
-- Keycloak `start-dev`
-- Keycloak's local development database
-- HTTP instead of HTTPS
+Kafka UI talks to Keycloak using Keycloak's **private VPC IP address** for the OIDC token, JWK, and user-info endpoints.
 
-Those choices make the lab easier to understand and cheaper than a production design.
+That means this server-to-server traffic stays inside the VPC.
 
 ---
 
-# 2. Why `t3.medium` is the default
+# 2. Why Keycloak is on a separate EC2
 
-Kafka, Kafka UI, and Keycloak are all Java applications.
+Originally Kafka, Kafka UI, and Keycloak shared one EC2 instance.
 
-Java applications need memory.
-
-A tiny EC2 instance may start, but it can quickly run out of RAM and Linux may kill one of the containers.
-
-The default is:
-
-```hcl
-instance_type = "t3.medium"
-```
-
-That provides a much more realistic small lab host than a micro or nano instance.
-
-You can experiment with a smaller instance later, but if containers disappear or restart, memory pressure is one of the first things to check.
-
----
-
-# 3. Why there is an Elastic IP
-
-OAuth login uses redirect URLs.
-
-A simplified login looks like this:
+That is easy to build, but it has an important downside:
 
 ```text
-1. Browser opens Kafka UI
-
-2. Kafka UI says:
-      You must log in
-
-3. Browser goes to Keycloak
-
-4. User enters username/password
-
-5. Keycloak redirects the browser back to Kafka UI
-```
-
-Keycloak only redirects to addresses that have been registered for the client.
-
-For example:
-
-```text
-http://18.200.10.25:8080/login/oauth2/code/keycloak
-```
-
-A normal EC2 public IPv4 address can change when an instance is stopped and started.
-
-This project therefore creates an **Elastic IP** so the OAuth callback address stays stable.
-
-AWS charges for public IPv4 addresses, including Elastic IP addresses, so destroy the lab when you are finished.
-
----
-
-# 4. AWS resources Terraform creates
-
-Terraform now uses an **EC2 Launch Template**. The Launch Template holds the machine settings such as the AMI, instance size, security group, IAM instance profile, disk, metadata settings, and startup script.
-
-```text
-VPC
+One EC2
  |
- +-- Internet Gateway
- |
- +-- Public Subnet
-      |
-      +-- Route Table -> Internet Gateway
-      |
-      +-- EC2 Security Group
-      |
-      +-- EC2 Launch Template
-      |    |
-      |    +-- Amazon Linux 2023 AMI
-      |    +-- t3.medium by default
-      |    +-- 30 GB gp3 root disk
-      |    +-- IAM instance profile
-      |    +-- Docker bootstrap user-data
-      |
-      +-- EC2 instance created from Launch Template
-           |
-           +-- Elastic IP
-           |
-           +-- Docker service
-                |
-                +-- Kafka
-                +-- Kafka UI
-                +-- Keycloak
+ +-- Kafka JVM
+ +-- Kafka UI JVM
+ +-- Keycloak JVM
 ```
 
-It also creates:
+All three Java processes compete for the same RAM.
 
-- An EC2 Launch Template
-- An EC2 IAM role
-- An EC2 instance profile
-- The `AmazonSSMManagedInstanceCore` policy attachment
-- Random passwords for the Keycloak administrator and Kafka UI user
-- A random OAuth client secret
+If memory becomes tight, Linux may kill one of the containers. Docker sees the container stop and starts it again because the Compose file uses:
 
-Why use a Launch Template here?
+```yaml
+restart: unless-stopped
+```
 
-- It keeps the EC2 configuration in one reusable AWS object.
-- The same template can later be used by an Auto Scaling Group if you want one.
-- Terraform creates a new Launch Template version when the boot configuration changes.
-- This project points the EC2 instance at the numeric latest template version, so a template change causes Terraform to replace the EC2 instance and actually run the new startup script.
-- The Elastic IP is a separate resource, so Terraform can attach that same stable address to the replacement instance.
+That looks like containers are "cycling" or continuously restarting.
+
+The new design is:
+
+```text
+Kafka EC2
+ +-- Kafka
+ +-- Kafka UI
+
+Keycloak EC2
+ +-- Keycloak
+```
+
+This is still a lab design, but it separates the major workloads and makes troubleshooting much simpler.
 
 ---
 
-# 5. Files in this project
+# 3. Files
 
 ```text
 kafka-keycloak-ec2/
-|
-|-- main.tf
-|-- terraform.tfvars.example
-|-- README.md
-|
-|-- files/
-|   |-- docker-compose.yml.tftpl
-|   |-- kafka-ui.yml.tftpl
-|   `-- keycloak-realm.json.tftpl
-|
-`-- templates/
-    `-- user_data.sh.tftpl
+├── main.tf
+├── terraform.tfvars.example
+├── README.md
+│
+├── files/
+│   ├── docker-compose.yml.tftpl
+│   ├── keycloak-compose.yml.tftpl
+│   ├── kafka-ui.yml.tftpl
+│   └── keycloak-realm.json.tftpl
+│
+└── templates/
+    ├── user_data.sh.tftpl
+    └── keycloak_user_data.sh.tftpl
 ```
 
 ## `main.tf`
 
-Creates all AWS infrastructure.
+Creates the AWS infrastructure:
 
-The EC2 configuration is stored in `aws_launch_template.stack`. Terraform then creates one `aws_instance.stack` from that Launch Template.
-
-The file also renders the Docker Compose and authentication configuration files and places them in Launch Template user-data so they are written onto the EC2 instance during first boot.
-
-## `terraform.tfvars.example`
-
-Shows the easiest variables to change.
-
-The most important one is:
-
-```hcl
-allowed_cidr = "YOUR.PUBLIC.IP.ADDRESS/32"
-```
-
-This controls which public IP can open Kafka UI and Keycloak.
-
-## `files/docker-compose.yml.tftpl`
-
-Defines the three containers:
-
-```text
-kafka
-keycloak
-kafka-ui
-```
-
-## `files/keycloak-realm.json.tftpl`
-
-Automatically creates:
-
-```text
-Realm:  kafka-ui
-Client: kafka-ui
-User:   kafkauser
-```
-
-Keycloak imports this file the first time the realm is created.
-
-## `files/kafka-ui.yml.tftpl`
-
-Tells Kafka UI:
-
-```text
-Kafka broker = kafka:9092
-Authentication = OAuth2
-Identity provider = Keycloak
-```
+- VPC
+- public subnet
+- Internet Gateway
+- public route table
+- Kafka security group
+- Keycloak security group
+- IAM role for SSM
+- instance profile
+- Kafka Elastic IP
+- Keycloak Elastic IP
+- Kafka Launch Template
+- Keycloak Launch Template
+- Kafka EC2
+- Keycloak EC2
 
 ## `templates/user_data.sh.tftpl`
 
-Runs when EC2 boots.
+Runs only on the **Kafka EC2**.
 
-It deliberately verifies Docker before starting the application stack:
+It:
 
-1. Installs Docker and `curl` on Amazon Linux 2023.
-2. Enables `docker.service` so Docker starts after every reboot.
-3. Starts Docker immediately.
-4. Waits until `docker info` succeeds; bootstrap fails if the daemon never becomes ready.
-5. Installs the Docker Compose CLI plugin.
-6. Writes the generated configuration files to `/opt/kafka-keycloak`.
-7. Validates the Compose file with `docker compose config`.
-8. Pulls the Docker images.
-9. Creates `kafka-keycloak-compose.service` in systemd.
-10. Starts that service, which runs `docker compose up -d`.
-11. Verifies both Docker and the Compose service are active.
+1. installs Docker
+2. enables Docker at boot
+3. verifies Docker is running
+4. installs Docker Compose
+5. writes the Kafka Compose file
+6. writes the Kafka UI OIDC configuration
+7. pulls Kafka and Kafka UI images
+8. starts the Compose stack
+9. creates a systemd service so it starts again after reboot
 
-That extra systemd service is useful because it gives the startup order a simple rule:
+## `templates/keycloak_user_data.sh.tftpl`
 
-```text
-EC2 boot
-   |
-   v
-Docker service
-   |
-   v
-kafka-keycloak-compose.service
-   |
-   v
-Kafka + Keycloak + Kafka UI
-```
+Runs only on the **Keycloak EC2**.
 
-The Compose services also use `restart: unless-stopped`, so Docker has two simple protections for reboot recovery: Docker itself is enabled, and the Compose stack has a systemd startup unit.
+It:
 
----
-
-# 6. Prerequisites
-
-You need these tools on your computer:
-
-```text
-Terraform
-AWS CLI
-```
-
-Optional but strongly recommended:
-
-```text
-AWS Session Manager plugin
-```
-
-Check Terraform:
-
-```bash
-terraform version
-```
-
-Check AWS CLI:
-
-```bash
-aws --version
-```
-
-Check which AWS account you are using:
-
-```bash
-aws sts get-caller-identity
-```
-
-You should see your AWS account and ARN.
+1. installs Docker
+2. enables Docker at boot
+3. verifies Docker is running
+4. installs Docker Compose
+5. writes the Keycloak Compose file
+6. writes the Keycloak realm import file
+7. validates the JSON
+8. pulls the Keycloak image
+9. starts Keycloak
+10. creates a systemd service so Keycloak starts after reboot
+11. waits for the OIDC discovery endpoint
 
 ---
 
-# 7. Configure AWS credentials
+# 4. Amazon Linux curl fix
 
-One common option is:
+Do **not** change the user-data scripts back to:
 
 ```bash
-aws configure
+dnf install -y docker curl
 ```
 
-Enter:
+Amazon Linux 2023 normally has `curl-minimal` installed already.
+
+Trying to install full `curl` can produce errors such as:
 
 ```text
-AWS Access Key ID
-AWS Secret Access Key
-Default region
-Output format
+package curl-minimal conflicts with curl
 ```
 
-For this project the default region is:
+This project instead does:
 
-```text
-us-east-1
+```bash
+dnf install -y docker
+
+if ! command -v curl >/dev/null 2>&1; then
+  dnf install -y curl-minimal
+fi
 ```
 
-A better enterprise design is usually IAM Identity Center / SSO or role-based access instead of long-lived access keys.
+That is enough for the HTTPS downloads used by the bootstrap.
 
 ---
 
-# 8. Protect Kafka UI and Keycloak with your public IP
+# 5. Instance sizes
 
-The example Terraform allows this variable:
+Defaults:
 
 ```hcl
-allowed_cidr
+kafka_instance_type    = "t3.medium"
+keycloak_instance_type = "t3.small"
 ```
 
-Copy the example file:
+For a lab this is much more predictable than putting every Java service on one `t3.medium`.
+
+The Kafka host runs:
+
+```text
+Kafka
+Kafka UI
+```
+
+The Keycloak host runs only:
+
+```text
+Keycloak
+```
+
+If you still see OOM kills, increase the appropriate instance type instead of increasing all services at once.
+
+---
+
+# 6. Configure Terraform variables
+
+Copy:
 
 ```bash
 cp terraform.tfvars.example terraform.tfvars
 ```
 
-Edit:
+Example:
 
 ```hcl
+aws_region   = "us-east-1"
+project_name = "kafka-keycloak-lab"
+
+kafka_instance_type    = "t3.medium"
+keycloak_instance_type = "t3.small"
+
 allowed_cidr = "YOUR_PUBLIC_IP/32"
+
+kafka_ui_username       = "kafkauser"
+keycloak_admin_username = "admin"
 ```
 
-For example, if your Internet address were:
+## Find your public IP
+
+For a temporary lab, find the public IPv4 address of the computer/browser that will access the services and use:
 
 ```text
-68.32.112.68
+YOUR_IP/32
 ```
 
-use:
+For example:
 
 ```hcl
-allowed_cidr = "68.32.112.68/32"
+allowed_cidr = "198.51.100.25/32"
 ```
 
-The `/32` means:
+Do not literally use that example address.
 
-> Allow exactly this one IPv4 address.
-
-For a quick lab you can use:
+You can use:
 
 ```hcl
 allowed_cidr = "0.0.0.0/0"
 ```
 
-but that means:
-
-> Allow every IPv4 address on the Internet to reach ports 8080 and 8081.
-
-That is easier for testing but less safe.
+for troubleshooting, but that exposes Kafka UI and Keycloak to the entire Internet and is not recommended.
 
 ---
 
-# 9. Initialize Terraform
+# 7. Create the lab
 
-From the project directory:
+Run:
 
 ```bash
 terraform init
 ```
 
-This downloads the Terraform providers.
-
-Validate the configuration:
+Then:
 
 ```bash
 terraform validate
 ```
 
-Format the Terraform file:
-
-```bash
-terraform fmt
-```
-
----
-
-# 10. Preview what Terraform will create
-
-Run:
+Then:
 
 ```bash
 terraform plan
 ```
 
-Terraform will show resources with a `+` sign.
+Review the plan carefully.
 
-Think of `terraform plan` as a preview before Terraform changes AWS.
+Finally:
+
+```bash
+terraform apply
+```
+
+Enter:
+
+```text
+yes
+```
 
 ---
 
-# 11. Create the environment
+# 8. Important migration note
+
+The previous version used one resource named:
+
+```text
+aws_instance.stack
+```
+
+The new design uses:
+
+```text
+aws_instance.kafka
+aws_instance.keycloak
+```
+
+Therefore Terraform will normally destroy the old single EC2 and create the two new EC2 instances.
+
+That is expected.
+
+This is a lab project, so the simplest migration is to let Terraform replace the old instance.
+
+Always inspect:
+
+```bash
+terraform plan
+```
+
+before applying.
+
+---
+
+# 9. Terraform outputs
 
 Run:
 
 ```bash
-terraform apply
+terraform output
+```
+
+Important outputs include:
+
+```text
+kafka_instance_id
+keycloak_instance_id
+kafka_public_ip
+keycloak_public_ip
+keycloak_private_ip
+kafka_ui_url
+keycloak_url
+keycloak_admin_url
+ssm_kafka
+ssm_keycloak
+```
+
+Get Kafka UI URL:
+
+```bash
+terraform output -raw kafka_ui_url
+```
+
+Get Keycloak URL:
+
+```bash
+terraform output -raw keycloak_url
+```
+
+---
+
+# 10. Get the generated passwords
+
+Kafka UI demo user's password:
+
+```bash
+terraform output -raw kafka_ui_user_password
+```
+
+The username defaults to:
+
+```text
+kafkauser
+```
+
+Keycloak administrator password:
+
+```bash
+terraform output -raw keycloak_admin_password
+```
+
+Administrator username:
+
+```bash
+terraform output -raw keycloak_admin_username
+```
+
+Remember: these passwords are stored in Terraform state. That is acceptable for this simple lab, but production systems should use a proper secrets-management approach.
+
+---
+
+# 11. Keycloak realm configuration
+
+At first startup Keycloak imports:
+
+```text
+/opt/keycloak-stack/keycloak-realm.json
+```
+
+The realm is:
+
+```text
+kafka-ui
+```
+
+Terraform automatically creates:
+
+```text
+Realm:     kafka-ui
+Client:    kafka-ui
+User:      kafkauser
+Protocol:  OpenID Connect
+```
+
+The Kafka UI client is confidential and has a generated client secret.
+
+---
+
+# 12. How Kafka UI OIDC works
+
+This part is important because there are **two different network paths**.
+
+## Browser/front-channel
+
+Your browser needs to see Keycloak.
+
+Kafka UI sends the browser to:
+
+```text
+http://KEYCLOAK_PUBLIC_IP:8081/realms/kafka-ui/protocol/openid-connect/auth
+```
+
+The user logs in.
+
+Keycloak redirects the browser back to:
+
+```text
+http://KAFKA_PUBLIC_IP:8080/login/oauth2/code/keycloak
+```
+
+That callback URL is also registered in the Keycloak client.
+
+## Server/back-channel
+
+After receiving the authorization code, Kafka UI must exchange it for tokens.
+
+Kafka UI does that directly against Keycloak's private VPC IP:
+
+```text
+http://KEYCLOAK_PRIVATE_IP:8081/realms/kafka-ui/protocol/openid-connect/token
+```
+
+It also uses the private address for:
+
+```text
+/certs
+/userinfo
+```
+
+This traffic does not need to leave the VPC.
+
+---
+
+# 13. Security groups
+
+There are now two security groups.
+
+## Kafka security group
+
+Inbound:
+
+```text
+TCP 8080 from allowed_cidr
+```
+
+There is deliberately no public inbound rule for:
+
+```text
+9092 Kafka
+22   SSH
+```
+
+## Keycloak security group
+
+Inbound:
+
+```text
+TCP 8081 from allowed_cidr
+```
+
+and:
+
+```text
+TCP 8081 from the Kafka EC2 security group
+```
+
+That second rule is what allows Kafka UI to call Keycloak privately.
+
+---
+
+# 14. Connect to Kafka EC2 with SSM
+
+Get the command:
+
+```bash
+terraform output -raw ssm_kafka
+```
+
+Or run:
+
+```bash
+aws ssm start-session \
+  --region us-east-1 \
+  --target $(terraform output -raw kafka_instance_id)
+```
+
+No SSH key or port 22 is required.
+
+---
+
+# 15. Connect to Keycloak EC2 with SSM
+
+```bash
+aws ssm start-session \
+  --region us-east-1 \
+  --target $(terraform output -raw keycloak_instance_id)
+```
+
+---
+
+# 16. Verify the Keycloak EC2 first
+
+Keycloak should be healthy before debugging Kafka UI authentication.
+
+Connect to the Keycloak EC2 and run:
+
+```bash
+sudo systemctl status docker --no-pager
+```
+
+Then:
+
+```bash
+sudo docker ps
+```
+
+Expected container:
+
+```text
+keycloak
+```
+
+Check Compose:
+
+```bash
+cd /opt/keycloak-stack
+sudo docker compose ps
+```
+
+Check local HTTP connectivity:
+
+```bash
+curl -i http://127.0.0.1:8081/
+```
+
+Check the realm discovery URL:
+
+```bash
+curl -s \
+  http://127.0.0.1:8081/realms/kafka-ui/.well-known/openid-configuration
+```
+
+If this works, Docker and Keycloak are working locally.
+
+---
+
+# 17. Check Keycloak container logs
+
+```bash
+cd /opt/keycloak-stack
+sudo docker compose logs --tail=200 keycloak
+```
+
+Follow logs live:
+
+```bash
+sudo docker compose logs -f keycloak
+```
+
+Check whether the container is restarting:
+
+```bash
+sudo docker inspect keycloak \
+  --format 'status={{.State.Status}} restart={{.RestartCount}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}'
+```
+
+A healthy result should look approximately like:
+
+```text
+status=running restart=0 exit=0 oom=false
+```
+
+---
+
+# 18. Verify Kafka EC2
+
+Connect to the Kafka EC2.
+
+Check Docker:
+
+```bash
+sudo systemctl status docker --no-pager
+```
+
+Check containers:
+
+```bash
+sudo docker ps
+```
+
+Expected:
+
+```text
+kafka
+kafka-ui
+```
+
+Then:
+
+```bash
+cd /opt/kafka-stack
+sudo docker compose ps
+```
+
+---
+
+# 19. Test Kafka UI locally on the EC2
+
+Run:
+
+```bash
+curl -I http://127.0.0.1:8080
+```
+
+A redirect response is normal because authentication is enabled.
+
+You may see something similar to:
+
+```text
+HTTP/1.1 302 Found
+```
+
+A `302` is not a failure here. It usually means Kafka UI is redirecting the browser into the login process.
+
+---
+
+# 20. Test Kafka EC2 -> Keycloak EC2 private networking
+
+Get Keycloak's private IP from your local machine:
+
+```bash
+terraform output -raw keycloak_private_ip
+```
+
+Suppose it returns:
+
+```text
+10.40.1.25
+```
+
+On the Kafka EC2 run:
+
+```bash
+curl -i http://10.40.1.25:8081/
+```
+
+Then test OIDC discovery:
+
+```bash
+curl -s \
+  http://10.40.1.25:8081/realms/kafka-ui/.well-known/openid-configuration
+```
+
+If the local Keycloak test works on Keycloak EC2 but this private-IP test fails from Kafka EC2, focus on:
+
+```text
+VPC routing
+Keycloak security group
+container port publishing
+Keycloak host firewall
+```
+
+In this project both EC2 instances are in the same VPC/subnet, so the VPC automatically has a `local` route between them.
+
+---
+
+# 21. Check listening ports on Keycloak EC2
+
+Run:
+
+```bash
+sudo ss -lntp
+```
+
+You should see a listener associated with Docker on port:
+
+```text
+8081
+```
+
+Also run:
+
+```bash
+sudo docker port keycloak
+```
+
+Expected approximately:
+
+```text
+8080/tcp -> 0.0.0.0:8081
+```
+
+The important part is:
+
+```text
+0.0.0.0:8081
+```
+
+That means the container's port is published on the EC2 network interfaces, not only on localhost.
+
+---
+
+# 22. Check listening ports on Kafka EC2
+
+```bash
+sudo ss -lntp
+```
+
+You should see host port:
+
+```text
+8080
+```
+
+Check Docker mapping:
+
+```bash
+sudo docker port kafka-ui
+```
+
+Expected approximately:
+
+```text
+8080/tcp -> 0.0.0.0:8080
+```
+
+---
+
+# 23. Why `curl localhost` can work while browser access fails
+
+This is a very useful troubleshooting distinction.
+
+If this works on the EC2:
+
+```bash
+curl http://127.0.0.1:8081
+```
+
+but this fails from your laptop:
+
+```text
+http://KEYCLOAK_PUBLIC_IP:8081
+```
+
+then the application itself is probably okay.
+
+Look at:
+
+```text
+Security Group inbound rule
+allowed_cidr
+Elastic IP association
+route table
+Internet Gateway
+Docker host port binding
+```
+
+Do not immediately change the Keycloak container configuration when the local EC2 curl already works.
+
+---
+
+# 24. Why public curl can fail from the same EC2
+
+Do not use a service's own Elastic IP as your primary local health check.
+
+For example, on Keycloak EC2 prefer:
+
+```bash
+curl http://127.0.0.1:8081
+```
+
+instead of:
+
+```bash
+curl http://KEYCLOAK_EIP:8081
+```
+
+The localhost check answers a simpler question:
+
+> Is the container/service listening correctly on this EC2?
+
+Then test private VPC connectivity from the other EC2.
+
+Finally test public connectivity from your browser/laptop.
+
+Troubleshoot one layer at a time.
+
+---
+
+# 25. Container restart/cycling troubleshooting
+
+List all containers including stopped containers:
+
+```bash
+sudo docker ps -a
+```
+
+Check restart count:
+
+```bash
+sudo docker inspect kafka \
+  --format 'restart={{.RestartCount}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}'
+```
+
+```bash
+sudo docker inspect kafka-ui \
+  --format 'restart={{.RestartCount}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}'
+```
+
+On Keycloak EC2:
+
+```bash
+sudo docker inspect keycloak \
+  --format 'restart={{.RestartCount}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}'
+```
+
+If you see:
+
+```text
+oom=true
+```
+
+Linux killed the process because the host ran short of memory.
+
+Check memory:
+
+```bash
+free -h
+```
+
+and:
+
+```bash
+sudo dmesg | grep -i -E 'oom|killed process|out of memory'
+```
+
+---
+
+# 26. Bootstrap logs
+
+Kafka host:
+
+```bash
+sudo tail -200 /var/log/kafka-bootstrap.log
+```
+
+Keycloak host:
+
+```bash
+sudo tail -200 /var/log/keycloak-bootstrap.log
+```
+
+Cloud-init output is also useful:
+
+```bash
+sudo tail -200 /var/log/cloud-init-output.log
+```
+
+Check whether cloud-init completed:
+
+```bash
+cloud-init status --long
+```
+
+---
+
+# 27. Docker service troubleshooting
+
+Check Docker:
+
+```bash
+sudo systemctl status docker --no-pager
+```
+
+If it is stopped:
+
+```bash
+sudo systemctl restart docker
+```
+
+Check logs:
+
+```bash
+sudo journalctl -u docker -n 200 --no-pager
+```
+
+Verify Docker can respond:
+
+```bash
+sudo docker info
+```
+
+---
+
+# 28. Compose systemd services
+
+Kafka EC2 has:
+
+```text
+kafka-compose.service
+```
+
+Check it:
+
+```bash
+sudo systemctl status kafka-compose.service --no-pager
+```
+
+Restart it:
+
+```bash
+sudo systemctl restart kafka-compose.service
+```
+
+Keycloak EC2 has:
+
+```text
+keycloak-compose.service
+```
+
+Check it:
+
+```bash
+sudo systemctl status keycloak-compose.service --no-pager
+```
+
+Restart:
+
+```bash
+sudo systemctl restart keycloak-compose.service
+```
+
+---
+
+# 29. OIDC redirect URI gotcha
+
+OIDC redirect URIs must match exactly.
+
+The Keycloak client contains a redirect similar to:
+
+```text
+http://KAFKA_EIP:8080/login/oauth2/code/keycloak
+```
+
+These are all different URLs to Keycloak:
+
+```text
+http://1.2.3.4:8080/login/oauth2/code/keycloak
+http://1.2.3.4/login/oauth2/code/keycloak
+https://1.2.3.4:8080/login/oauth2/code/keycloak
+http://1.2.3.5:8080/login/oauth2/code/keycloak
+```
+
+A changed IP, port, protocol, or callback path can cause an invalid redirect URI error.
+
+This project uses Elastic IPs to keep those URLs stable.
+
+---
+
+# 30. OIDC issuer / public-hostname gotcha
+
+Keycloak identifies itself using the configured public hostname:
+
+```text
+http://KEYCLOAK_EIP:8081
+```
+
+The browser should always use that public address.
+
+Kafka UI's backend is allowed to contact Keycloak through its private VPC IP for direct server-to-server API calls.
+
+If you later change from HTTP to HTTPS or put Keycloak behind a load balancer, update **all** of the following together:
+
+```text
+Keycloak KC_HOSTNAME
+Kafka UI authorization URI
+Kafka UI token URI if appropriate
+JWK URI
+userinfo URI
+Keycloak redirect URIs
+Keycloak web origins
+```
+
+OIDC is sensitive to URL mismatches.
+
+---
+
+# 31. Kafka UI logs
+
+On Kafka EC2:
+
+```bash
+cd /opt/kafka-stack
+sudo docker compose logs --tail=200 kafka-ui
+```
+
+Look for terms such as:
+
+```text
+oauth
+oidc
+keycloak
+connection refused
+timeout
+redirect
+client secret
+401
+403
+```
+
+Follow live:
+
+```bash
+sudo docker compose logs -f kafka-ui
+```
+
+---
+
+# 32. Kafka logs
+
+```bash
+cd /opt/kafka-stack
+sudo docker compose logs --tail=200 kafka
+```
+
+Useful checks:
+
+```bash
+sudo docker exec kafka \
+  /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:9092 \
+  --list
+```
+
+Create a test topic:
+
+```bash
+sudo docker exec kafka \
+  /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:9092 \
+  --create \
+  --topic test-topic \
+  --partitions 1 \
+  --replication-factor 1
+```
+
+List again:
+
+```bash
+sudo docker exec kafka \
+  /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:9092 \
+  --list
+```
+
+---
+
+# 33. Test the login flow
+
+First verify Keycloak directly in a browser:
+
+```text
+http://KEYCLOAK_EIP:8081
+```
+
+Then open Kafka UI:
+
+```text
+http://KAFKA_EIP:8080
+```
+
+Kafka UI should redirect you to Keycloak.
+
+Login using:
+
+```text
+username: kafkauser
+password: terraform output -raw kafka_ui_user_password
+```
+
+After successful authentication, Keycloak redirects you back to Kafka UI.
+
+---
+
+# 34. If Kafka UI says connection refused to Keycloak
+
+First get Keycloak private IP:
+
+```bash
+terraform output -raw keycloak_private_ip
+```
+
+From Kafka EC2:
+
+```bash
+curl -v http://KEYCLOAK_PRIVATE_IP:8081/
+```
+
+If that fails, check Keycloak's SG:
+
+```bash
+aws ec2 describe-security-groups \
+  --region us-east-1 \
+  --group-ids YOUR_KEYCLOAK_SECURITY_GROUP_ID
+```
+
+There should be an inbound rule allowing TCP `8081` from the **Kafka security group**.
+
+Also verify on Keycloak EC2:
+
+```bash
+sudo ss -lntp | grep 8081
+```
+
+---
+
+# 35. If Kafka UI opens but login loops
+
+Common causes:
+
+1. wrong redirect URI
+2. stale browser cookies
+3. changed Elastic IP
+4. incorrect OIDC client secret
+5. Keycloak realm was imported before the expected configuration changed
+
+For a disposable lab, the easiest way to force a clean Keycloak realm import is to recreate the Keycloak EC2 and its Docker volume.
+
+You can replace just Keycloak EC2 with:
+
+```bash
+terraform apply -replace=aws_instance.keycloak
+```
+
+Because the Docker volume lives on the instance's root disk, replacing the instance gives Keycloak a fresh local data directory.
+
+---
+
+# 36. If changing user-data does not affect an existing EC2
+
+EC2 user-data normally runs during the instance's first boot.
+
+Updating the Launch Template creates a new version, but the already-running instance does not magically rerun the bootstrap.
+
+For this lab, replace the appropriate instance.
+
+Kafka host:
+
+```bash
+terraform apply -replace=aws_instance.kafka
+```
+
+Keycloak host:
+
+```bash
+terraform apply -replace=aws_instance.keycloak
+```
+
+Both:
+
+```bash
+terraform apply \
+  -replace=aws_instance.kafka \
+  -replace=aws_instance.keycloak
+```
+
+Always inspect the plan first when the instances contain data you care about.
+
+---
+
+# 37. Public network troubleshooting checklist
+
+If a browser cannot reach Kafka UI or Keycloak, check in this order.
+
+## A. Is the container running?
+
+```bash
+sudo docker ps
+```
+
+## B. Can EC2 reach it locally?
+
+Kafka:
+
+```bash
+curl -I http://127.0.0.1:8080
+```
+
+Keycloak:
+
+```bash
+curl -I http://127.0.0.1:8081
+```
+
+## C. Is Docker publishing the port?
+
+```bash
+sudo ss -lntp
+```
+
+## D. Is the Elastic IP attached to the correct EC2?
+
+```bash
+aws ec2 describe-addresses --region us-east-1
+```
+
+## E. Does the security group allow your current public IP?
+
+Your home/office/VPN IP may change.
+
+## F. Does the subnet route to the Internet Gateway?
+
+The route table should contain:
+
+```text
+0.0.0.0/0 -> igw-xxxxxxxx
+```
+
+---
+
+# 38. Check AWS instances
+
+```bash
+aws ec2 describe-instances \
+  --region us-east-1 \
+  --filters "Name=tag:Name,Values=*kafka-keycloak-lab*" \
+  --query 'Reservations[].Instances[].{Name:Tags[?Key==`Name`]|[0].Value,Id:InstanceId,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,State:State.Name}' \
+  --output table
+```
+
+You should see two instances:
+
+```text
+kafka-keycloak-lab-kafka-ec2
+kafka-keycloak-lab-keycloak-ec2
+```
+
+---
+
+# 39. SSM troubleshooting
+
+If Session Manager says the instance is not connected, check the EC2 IAM instance profile and confirm the role has:
+
+```text
+AmazonSSMManagedInstanceCore
+```
+
+On the instance:
+
+```bash
+sudo systemctl status amazon-ssm-agent --no-pager
+```
+
+Restart if needed:
+
+```bash
+sudo systemctl restart amazon-ssm-agent
+```
+
+---
+
+# 40. Cost notes
+
+This design costs more than the single-host design because there are now two running EC2 instances and two Elastic IPv4 addresses.
+
+The tradeoff is isolation and simpler troubleshooting.
+
+For temporary labs, destroy resources when finished:
+
+```bash
+terraform destroy
 ```
 
 Review the plan and enter:
@@ -451,1158 +1318,167 @@ Review the plan and enter:
 yes
 ```
 
-Terraform creates the AWS infrastructure and returns outputs.
+---
 
-Useful outputs include:
+# 41. Production warnings
+
+This project is intentionally simple and designed for learning/testing.
+
+It is **not a production Keycloak/Kafka architecture**.
+
+Production systems should normally consider:
+
+- HTTPS/TLS
+- private subnets
+- an Application Load Balancer or other ingress layer
+- DNS names instead of raw IP addresses
+- external PostgreSQL for Keycloak
+- multi-node Kafka
+- Kafka authentication and TLS
+- proper secret storage
+- restricted security groups
+- backups
+- monitoring
+- log collection
+- multi-AZ design
+- patching strategy
+- autoscaling where appropriate
+
+Keycloak here uses:
 
 ```text
-kafka_ui_url
-keycloak_url
-keycloak_admin_url
-public_ip
-ssm_start_session
+start-dev
 ```
+
+which is intentionally a development-mode setup.
 
 ---
 
-# 12. Get the Kafka UI URL
+# 42. Fast troubleshooting sequence
 
-Run:
+When something is broken, use this order.
+
+### Keycloak EC2
 
 ```bash
-terraform output -raw kafka_ui_url
+sudo docker ps -a
+curl -I http://127.0.0.1:8081
+sudo docker logs --tail=100 keycloak
+sudo ss -lntp | grep 8081
 ```
 
-Example:
+### Kafka EC2
+
+```bash
+sudo docker ps -a
+curl -I http://127.0.0.1:8080
+sudo docker logs --tail=100 kafka
+sudo docker logs --tail=100 kafka-ui
+sudo ss -lntp | grep 8080
+```
+
+### Kafka EC2 to Keycloak private address
+
+```bash
+KEYCLOAK_PRIVATE_IP=$(terraform output -raw keycloak_private_ip)
+```
+
+If running this command from your local Terraform directory, use the returned address when connected to Kafka EC2:
+
+```bash
+curl -v http://KEYCLOAK_PRIVATE_IP:8081/realms/kafka-ui/.well-known/openid-configuration
+```
+
+If localhost works but private networking does not, inspect AWS networking.
+
+If private networking works but browser access does not, inspect public security-group/EIP routing.
+
+If networking works but OAuth login fails, inspect the OIDC URLs, redirect URI, client secret, and Keycloak/Kafka UI logs.
+
+That separation prevents changing several unrelated settings at once.
+
+
+## Fix: EC2 instance type not supported in the selected Availability Zone
+
+If AWS reports an error similar to:
 
 ```text
-http://18.200.10.25:8080
+Unsupported: Your requested instance type (t3.small) is not supported in your requested Availability Zone (us-east-1e).
 ```
 
-Open that URL in your browser.
+the problem is **not Docker or Keycloak**. An AWS subnet belongs to exactly one Availability Zone, and not every EC2 instance type is offered in every AZ. If a subnet is created without an explicit AZ, AWS may place it in an AZ such as `us-east-1e`, even though one of the requested instance types cannot run there.
 
-Kafka UI should require Keycloak login.
+This project now avoids that problem automatically. Terraform queries the EC2 instance-type offerings for both configured instance types, finds the Availability Zones common to both, and creates the public subnet in the first common AZ.
 
----
-
-# 13. Get the Kafka UI username and password
-
-Username:
-
-```bash
-terraform output -raw kafka_ui_username
-```
-
-Default:
-
-```text
-kafkauser
-```
-
-Password:
-
-```bash
-terraform output -raw kafka_ui_user_password
-```
-
-The password is generated by Terraform.
-
-Do not expect to see sensitive Terraform outputs in the normal output listing. Use `terraform output -raw` for the specific value.
-
----
-
-# 14. Kafka UI login flow
-
-When you open:
-
-```text
-http://ELASTIC-IP:8080
-```
-
-Kafka UI should redirect you to Keycloak.
-
-The Keycloak realm is:
-
-```text
-kafka-ui
-```
-
-Log in with:
-
-```text
-Username: kafkauser
-Password: use terraform output -raw kafka_ui_user_password
-```
-
-After authentication, Keycloak redirects the browser to:
-
-```text
-http://ELASTIC-IP:8080/login/oauth2/code/keycloak
-```
-
-Kafka UI exchanges the authorization code with Keycloak and creates your authenticated UI session.
-
----
-
-# 15. Why Kafka UI uses two kinds of Keycloak addresses
-
-This is one of the most important parts of this configuration.
-
-There are two paths.
-
-## Front channel
-
-The **browser** must be able to reach Keycloak.
-
-Therefore Kafka UI uses the EC2 Elastic IP for the authorization page:
-
-```text
-http://ELASTIC-IP:8081/realms/kafka-ui/protocol/openid-connect/auth
-```
-
-## Back channel
-
-Kafka UI itself is a Docker container.
-
-It can talk directly to the Keycloak container over Docker networking:
-
-```text
-http://keycloak:8080
-```
-
-Therefore token, key, and user-information requests use the Docker service name.
-
-Example:
-
-```text
-http://keycloak:8080/realms/kafka-ui/protocol/openid-connect/token
-```
-
-This avoids sending internal service-to-service OAuth traffic out through the public Internet path.
-
----
-
-# 16. Open the Keycloak Admin Console
-
-Get the URL:
-
-```bash
-terraform output -raw keycloak_admin_url
-```
-
-Get the admin username:
-
-```bash
-terraform output -raw keycloak_admin_username
-```
-
-Get the generated password:
-
-```bash
-terraform output -raw keycloak_admin_password
-```
-
-Open the admin URL and log in.
-
-The administrator initially belongs to the Keycloak `master` realm.
-
-After login, use the realm selector and choose:
-
-```text
-kafka-ui
-```
-
-You should see:
-
-```text
-Clients
-  kafka-ui
-
-Users
-  kafkauser
-```
-
----
-
-# 17. Connect to EC2 without SSH
-
-This project does not open port 22.
-
-Instead it attaches the AWS-managed SSM policy to EC2.
-
-Get the command:
-
-```bash
-terraform output -raw ssm_start_session
-```
-
-It will look similar to:
-
-```bash
-aws ssm start-session \
-  --region us-east-1 \
-  --target i-0123456789abcdef0
-```
-
-If AWS CLI reports:
-
-```text
-SessionManagerPlugin is not found
-```
-
-install the AWS Session Manager plugin on your local computer and run the command again.
-
----
-
-# 17A. Verify the Launch Template
-
-Terraform outputs both the Launch Template ID and the instance ID:
-
-```bash
-terraform output -raw launch_template_id
-terraform output -raw instance_id
-```
-
-You can verify them with AWS CLI:
-
-```bash
-aws ec2 describe-launch-templates \
-  --region us-east-1 \
-  --launch-template-ids "$(terraform output -raw launch_template_id)"
-```
-
-```bash
-aws ec2 describe-instances \
-  --region us-east-1 \
-  --instance-ids "$(terraform output -raw instance_id)" \
-  --query 'Reservations[0].Instances[0].{InstanceId:InstanceId,State:State.Name,LaunchTemplate:LaunchTemplate}'
-```
-
----
-
-# 18. Check first-boot setup and Docker
-
-After connecting with SSM:
-
-```bash
-sudo cloud-init status
-```
-
-To wait for first-boot configuration to finish:
-
-```bash
-sudo cloud-init status --wait
-```
-
-The normal cloud-init log is:
-
-```bash
-sudo tail -200 /var/log/cloud-init-output.log
-```
-
-This project also writes a shorter dedicated bootstrap log:
-
-```bash
-sudo tail -200 /var/log/kafka-keycloak-bootstrap.log
-```
-
-Verify Docker itself:
-
-```bash
-sudo systemctl status docker --no-pager
-sudo systemctl is-enabled docker
-sudo systemctl is-active docker
-sudo docker info
-```
-
-Expected important results:
-
-```text
-enabled
-active
-```
-
-Verify the Compose startup service:
-
-```bash
-sudo systemctl status kafka-keycloak-compose.service --no-pager
-sudo systemctl is-enabled kafka-keycloak-compose.service
-sudo systemctl is-active kafka-keycloak-compose.service
-```
-
-After an EC2 reboot you should not have to manually run `docker compose up -d`; systemd starts Docker first and then starts the Compose stack.
-
----
-
-# 19. Find the Docker Compose files on EC2
-
-The generated files are stored here:
-
-```text
-/opt/kafka-keycloak
-```
-
-View them:
-
-```bash
-sudo ls -la /opt/kafka-keycloak
-```
-
-You should see:
-
-```text
-docker-compose.yml
-kafka-ui.yml
-keycloak-realm.json
-```
-
----
-
-# 20. Check the containers
-
-Run:
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose ps
-```
-
-Expected containers:
-
-```text
-kafka
-kafka-ui
-keycloak
-```
-
-Also try:
-
-```bash
-sudo docker ps
-```
-
----
-
-# 21. View Kafka logs
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose logs kafka
-```
-
-Follow them:
-
-```bash
-sudo docker compose logs -f kafka
-```
-
----
-
-# 22. View Kafka UI logs
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose logs kafka-ui
-```
-
-Follow them:
-
-```bash
-sudo docker compose logs -f kafka-ui
-```
-
-OAuth configuration errors are usually visible here.
-
----
-
-# 23. View Keycloak logs
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose logs keycloak
-```
-
-Follow them:
-
-```bash
-sudo docker compose logs -f keycloak
-```
-
-Look for messages showing that the `kafka-ui` realm was imported.
-
----
-
-# 24. Verify Kafka directly
-
-List topics from inside the Kafka container:
-
-```bash
-sudo docker exec kafka \
-  /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server kafka:9092 \
-  --list
-```
-
-If that command works, the broker is accepting Kafka connections.
-
----
-
-# 25. Create a Kafka topic from the command line
-
-Create a topic named `demo`:
-
-```bash
-sudo docker exec kafka \
-  /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server kafka:9092 \
-  --create \
-  --topic demo \
-  --partitions 1 \
-  --replication-factor 1
-```
-
-List topics again:
-
-```bash
-sudo docker exec kafka \
-  /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server kafka:9092 \
-  --list
-```
-
-You should see:
-
-```text
-demo
-```
-
-Refresh Kafka UI and the topic should appear there too.
-
----
-
-# 26. Produce a test message
-
-Run:
-
-```bash
-echo 'hello from kafka' | \
-sudo docker exec -i kafka \
-  /opt/kafka/bin/kafka-console-producer.sh \
-  --bootstrap-server kafka:9092 \
-  --topic demo
-```
-
-That sends one message to the `demo` topic.
-
----
-
-# 27. Consume the test message
-
-Run:
-
-```bash
-sudo docker exec kafka \
-  /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server kafka:9092 \
-  --topic demo \
-  --from-beginning \
-  --max-messages 1
-```
-
-Expected text:
-
-```text
-hello from kafka
-```
-
-You can also open the topic in Kafka UI and inspect its messages.
-
----
-
-# 28. How Kafka networking works here
-
-Docker creates a private network named:
-
-```text
-kafka-keycloak-appnet
-```
-
-Docker Compose service names become DNS names inside that network.
-
-That means Kafka UI can use:
-
-```text
-kafka:9092
-```
-
-instead of needing the EC2 public IP.
-
-Keycloak can be reached internally as:
-
-```text
-keycloak:8080
-```
-
-This is why Kafka port 9092 does not need a public security-group rule.
-
----
-
-# 29. Kafka KRaft mode explained simply
-
-Older Kafka deployments commonly used ZooKeeper.
-
-Modern Kafka can use **KRaft** instead.
-
-KRaft lets Kafka manage its cluster metadata without ZooKeeper.
-
-This lab makes the same Kafka process both:
-
-```text
-broker
-controller
-```
-
-The important Docker variables include:
-
-```yaml
-KAFKA_PROCESS_ROLES: "broker,controller"
-KAFKA_NODE_ID: "1"
-KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
-```
-
-Because there is only one Kafka node, replication-related values are set to `1`.
-
-That is appropriate for a lab but not for high availability.
-
----
-
-# 30. Keycloak realm import explained
-
-The Docker Compose configuration mounts:
-
-```text
-keycloak-realm.json
-```
-
-into:
-
-```text
-/opt/keycloak/data/import/kafka-ui-realm.json
-```
-
-Keycloak starts with:
-
-```text
-start-dev --import-realm
-```
-
-That tells Keycloak:
-
-> When starting, look in the import directory and create any realm that does not already exist.
-
-An important Keycloak behavior is that startup import does **not overwrite an existing realm**.
-
-This protects an existing realm from being silently replaced on every restart.
-
-If you change the realm JSON later and expect it to replace the current realm, you must deliberately delete/re-import the realm or rebuild the Keycloak development data.
-
----
-
-# 31. Kafka UI OAuth configuration explained
-
-The important part is:
-
-```yaml
-auth:
-  type: OAUTH2
-```
-
-That tells Kafka UI:
-
-> Do not use the UI until the user authenticates through an OAuth2 provider.
-
-The configured provider is Keycloak:
-
-```yaml
-clientId: kafka-ui
-provider: keycloak
-scope: openid
-```
-
-OpenID Connect is built on OAuth2 and adds identity information about the logged-in user.
-
-The username claim is:
-
-```yaml
-user-name-attribute: preferred_username
-```
-
-For the imported demo user, that becomes:
-
-```text
-kafkauser
-```
-
----
-
-# 32. Why Kafka itself has no Keycloak login
-
-This project protects **Kafka UI** with Keycloak.
-
-It does not configure Kafka broker authentication with Keycloak.
-
-The architecture is:
-
-```text
-User
- |
- | Keycloak login
- v
-Kafka UI
- |
- | internal plaintext Kafka connection
- v
-Kafka
-```
-
-That is simpler for learning.
-
-A production Kafka cluster normally has its own broker-level authentication and encryption, such as:
-
-- SASL/SCRAM
-- mTLS
-- SASL/OAUTHBEARER
-- AWS MSK IAM authentication
-
-Do not assume protecting Kafka UI automatically protects a publicly exposed Kafka broker. This project avoids that problem by not exposing Kafka's broker port publicly at all.
-
----
-
-# 33. Restart all containers
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose restart
-```
-
----
-
-# 34. Stop the containers
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose stop
-```
-
----
-
-# 35. Start the containers again
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose start
-```
-
----
-
-# 36. Re-create the containers
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose up -d
-```
-
----
-
-# 37. Pull images again
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose pull
-sudo docker compose up -d
-```
-
-The project pins Kafka and Keycloak versions. Kafka UI is also pinned to `v1.5.0` in the supplied compose template for repeatability.
-
----
-
-# 38. Troubleshooting: browser cannot connect to port 8080 or 8081
-
-First check Terraform output:
-
-```bash
-terraform output public_ip
-```
-
-Then verify the security group allows your current Internet IP.
-
-If you changed networks, your home/office public IP may have changed.
-
-For a temporary test you can change:
+The relevant logic is:
 
 ```hcl
-allowed_cidr = "0.0.0.0/0"
+data "aws_ec2_instance_type_offerings" "kafka" {
+  filter {
+    name   = "instance-type"
+    values = [var.kafka_instance_type]
+  }
+  location_type = "availability-zone"
+}
+
+data "aws_ec2_instance_type_offerings" "keycloak" {
+  filter {
+    name   = "instance-type"
+    values = [var.keycloak_instance_type]
+  }
+  location_type = "availability-zone"
+}
+
+locals {
+  common_instance_azs = sort(tolist(setintersection(
+    toset(data.aws_ec2_instance_type_offerings.kafka.locations),
+    toset(data.aws_ec2_instance_type_offerings.keycloak.locations)
+  )))
+
+  selected_availability_zone = try(local.common_instance_azs[0], null)
+}
 ```
 
-and run:
+The subnet then uses:
+
+```hcl
+availability_zone = local.selected_availability_zone
+```
+
+To see what Terraform selected:
 
 ```bash
-terraform apply
+terraform output selected_availability_zone
+terraform output supported_common_availability_zones
 ```
 
-If it works afterward, your previous CIDR was probably wrong.
+For example, in one account the result may be:
 
-Change it back to your `/32` once you know the correct address.
-
----
-
-# 39. Troubleshooting: EC2 exists but containers are missing
-
-Connect with SSM and start with the two boot logs:
-
-```bash
-sudo cloud-init status
-sudo tail -200 /var/log/cloud-init-output.log
-sudo tail -200 /var/log/kafka-keycloak-bootstrap.log
+```text
+selected_availability_zone = "us-east-1a"
 ```
 
-Check Docker first:
+Do not assume the same letter mapping or offerings in every AWS account. Letting Terraform query the EC2 offerings is safer than permanently hard-coding an AZ.
 
-```bash
-sudo systemctl status docker --no-pager
-sudo systemctl is-enabled docker
-sudo systemctl is-active docker
-sudo docker info
-```
+### If an old subnet already exists in the bad AZ
 
-If Docker is not active:
-
-```bash
-sudo systemctl enable --now docker
-```
-
-Then check the Compose startup service:
-
-```bash
-sudo systemctl status kafka-keycloak-compose.service --no-pager
-sudo journalctl -u kafka-keycloak-compose.service -n 100 --no-pager
-```
-
-Restart the stack service if needed:
-
-```bash
-sudo systemctl restart kafka-keycloak-compose.service
-```
-
-Check Docker Compose and the generated files:
-
-```bash
-sudo docker compose version
-sudo ls -la /opt/kafka-keycloak
-```
-
-Manual fallback:
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose config
-sudo docker compose pull
-sudo docker compose up -d
-sudo docker compose ps
-```
-
-If you changed `main.tf`, the Docker boot script, the AMI, or another Launch Template setting, run:
+Changing a subnet's Availability Zone requires replacing that subnet. Run:
 
 ```bash
 terraform plan
-terraform apply
 ```
 
-A new Launch Template version should cause Terraform to replace the EC2 instance. The Elastic IP is then associated with the replacement instance.
-
----
-
-# 40. Troubleshooting: Kafka UI loads but cannot see Kafka
-
-Run:
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose logs kafka-ui
-```
-
-Then check Kafka:
-
-```bash
-sudo docker exec kafka \
-  /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server kafka:9092 \
-  --list
-```
-
-Also inspect the Kafka UI configuration:
-
-```bash
-sudo cat /opt/kafka-keycloak/kafka-ui.yml
-```
-
-You should see:
-
-```yaml
-bootstrapServers: kafka:9092
-```
-
----
-
-# 41. Troubleshooting: Keycloak page loads but Kafka UI login fails
-
-Check both logs:
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose logs kafka-ui
-sudo docker compose logs keycloak
-```
-
-Check the callback URL in the generated realm file:
-
-```bash
-sudo grep -n "redirect" /opt/kafka-keycloak/keycloak-realm.json
-```
-
-It should use the same Elastic IP shown by:
-
-```bash
-terraform output -raw public_ip
-```
-
-The callback should look like:
-
-```text
-http://ELASTIC-IP:8080/login/oauth2/code/keycloak
-```
-
----
-
-# 42. Troubleshooting: `invalid_redirect_uri`
-
-This means Keycloak received an OAuth request containing a callback address that does not match what the client allows.
-
-Check:
-
-```bash
-terraform output -raw public_ip
-```
-
-Then open the Keycloak Admin Console:
-
-```text
-Realm: kafka-ui
-Clients
-kafka-ui
-Valid redirect URIs
-```
-
-Expected value:
-
-```text
-http://ELASTIC-IP:8080/login/oauth2/code/keycloak
-```
-
----
-
-# 43. Troubleshooting: realm changes do not appear
-
-Keycloak skips startup import if the realm already exists.
-
-For a disposable lab, one clean reset is:
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose down -v
-sudo docker compose up -d
-```
-
-**Warning:** `-v` deletes the Docker volumes for this lab. Kafka data and Keycloak development data will be removed.
-
-Use this only when you intentionally want a clean lab reset.
-
----
-
-# 44. Check memory problems
-
-Run:
-
-```bash
-free -h
-```
-
-Check container usage:
-
-```bash
-sudo docker stats
-```
-
-Check whether Linux killed a process because of low memory:
-
-```bash
-sudo dmesg | grep -i -E 'oom|out of memory|killed process'
-```
-
-If you see out-of-memory messages, increase the EC2 size.
-
-Example:
-
-```hcl
-instance_type = "t3.large"
-```
-
-Then:
+You should see Terraform replace the public subnet and the EC2 resources that depend on it. For this lab that is expected. Then run:
 
 ```bash
 terraform apply
 ```
 
-Depending on the Terraform change, the instance may be stopped/restarted or replaced, so review the plan carefully first.
-
----
-
-# 45. Security notes
-
-This configuration is intentionally easy to learn from, not hardened for production.
-
-Important limitations:
-
-1. Kafka UI uses HTTP.
-2. Keycloak uses HTTP.
-3. Keycloak uses `start-dev`.
-4. Keycloak uses its local development database.
-5. Kafka is a one-node cluster.
-6. Kafka's Docker-network connection uses PLAINTEXT.
-7. Terraform-generated passwords and OAuth client secrets are stored in Terraform state.
-8. Opening `allowed_cidr = "0.0.0.0/0"` exposes Kafka UI and Keycloak to the Internet.
-
-For anything beyond a lab, use HTTPS and a proper secret-management design.
-
----
-
-# 46. What a more production-ready design looks like
-
-A stronger design would normally separate the components.
-
-Example:
-
-```text
-Internet
-   |
-   v
-HTTPS ALB
-   |
-   +----------------------+
-   |                      |
-   v                      v
-Kafka UI               Keycloak
-private compute        private compute
-                          |
-                          v
-                    RDS PostgreSQL
-
-Kafka applications
-   |
-   v
-Amazon MSK or multi-node Kafka
-```
-
-Production improvements include:
-
-- HTTPS certificates
-- Application Load Balancer or another reverse proxy
-- Private subnets
-- Keycloak backed by PostgreSQL/RDS
-- Multiple Keycloak instances if high availability is needed
-- Amazon MSK or multiple Kafka brokers/controllers
-- Kafka encryption/authentication
-- AWS Secrets Manager or SSM Parameter Store for secrets
-- CloudWatch logs/metrics
-- Backups
-- Auto Scaling where appropriate
-- Least-privilege IAM
-
----
-
-# 47. Destroy the lab
-
-When you are finished:
+If you want to rebuild only the lab and do not need any data on its EC2/EBS resources, a clean lab reset is also possible with:
 
 ```bash
 terraform destroy
-```
-
-Review the destroy plan carefully.
-
-Enter:
-
-```text
-yes
-```
-
-Terraform should remove:
-
-- EC2
-- Elastic IP
-- VPC networking
-- Security group
-- IAM role/profile created by this project
-- EBS root volume
-
-Destroying the lab is important because EC2, EBS, and public IPv4 resources can continue creating AWS charges while they exist.
-
----
-
-# 48. Quick command cheat sheet
-
-## Create
-
-```bash
-terraform init
-terraform validate
-terraform plan
 terraform apply
 ```
 
-## URLs
-
-```bash
-terraform output -raw kafka_ui_url
-terraform output -raw keycloak_url
-terraform output -raw keycloak_admin_url
-```
-
-## User credentials
-
-```bash
-terraform output -raw kafka_ui_username
-terraform output -raw kafka_ui_user_password
-```
-
-## Keycloak administrator
-
-```bash
-terraform output -raw keycloak_admin_username
-terraform output -raw keycloak_admin_password
-```
-
-## SSM
-
-```bash
-terraform output -raw ssm_start_session
-```
-
-## Containers
-
-```bash
-cd /opt/kafka-keycloak
-sudo docker compose ps
-sudo docker compose logs -f kafka
-sudo docker compose logs -f kafka-ui
-sudo docker compose logs -f keycloak
-```
-
-## Kafka topic
-
-```bash
-sudo docker exec kafka \
-  /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server kafka:9092 \
-  --list
-```
-
-## Destroy
-
-```bash
-terraform destroy
-```
-
----
-
-# 49. Official references
-
-These are useful background references for the technologies used by this project.
-
-## Apache Kafka Docker
-
-https://kafka.apache.org/43/getting-started/docker/
-
-## Apache Kafka Docker examples
-
-https://github.com/apache/kafka/tree/trunk/docker/examples
-
-## Kafbat Kafka UI
-
-https://github.com/kafbat/kafka-ui
-
-## Kafbat OAuth2 authentication
-
-https://ui.docs.kafbat.io/configuration/authentication/for-the-ui/oauth2
-
-## Kafbat configuration file
-
-https://ui.docs.kafbat.io/configuration/configuration-file
-
-## Keycloak containers
-
-https://www.keycloak.org/server/containers
-
-## Keycloak realm import/export
-
-https://www.keycloak.org/server/importExport
-
-## Keycloak hostname configuration
-
-https://www.keycloak.org/server/hostname
-
-## AWS Docker on Amazon Linux 2023
-
-https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-docker.html
-
-## Docker Compose plugin
-
-https://docs.docker.com/compose/install/linux/
-
----
-
-# Final learning summary
-
-The most important concepts in this lab are:
-
-```text
-Terraform
-   creates AWS infrastructure
-
-EC2
-   provides one Linux computer
-
-Docker Compose
-   runs multiple applications on that computer
-
-Kafka
-   stores and moves event messages
-
-Kafka UI
-   gives you a browser interface to Kafka
-
-Keycloak
-   authenticates the person using Kafka UI
-
-OAuth2 / OpenID Connect
-   lets Kafka UI trust the Keycloak login
-
-Docker networking
-   lets containers use names such as kafka and keycloak
-   instead of public IP addresses
-
-SSM
-   lets you administer EC2 without opening SSH to the Internet
-```
-
-That separation is useful to remember because each layer solves a different problem.
+Do not use `destroy` if you have data you need to preserve.

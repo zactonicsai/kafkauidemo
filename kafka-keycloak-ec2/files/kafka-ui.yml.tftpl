@@ -13,16 +13,16 @@ auth:
         scope: openid
         client-name: Keycloak
         provider: keycloak
-        redirect-uri: "http://${public_ip}:8080/login/oauth2/code/keycloak"
+        redirect-uri: "http://${kafka_public_ip}:8080/login/oauth2/code/keycloak"
         authorization-grant-type: authorization_code
 
-        # Front-channel: the user's browser can reach this public address.
-        authorization-uri: "http://${public_ip}:8081/realms/kafka-ui/protocol/openid-connect/auth"
+        # Browser/front-channel address.
+        authorization-uri: "http://${keycloak_public_ip}:8081/realms/kafka-ui/protocol/openid-connect/auth"
 
-        # Back-channel: Kafka UI reaches Keycloak over the private Docker network.
-        token-uri: "http://keycloak:8080/realms/kafka-ui/protocol/openid-connect/token"
-        jwk-set-uri: "http://keycloak:8080/realms/kafka-ui/protocol/openid-connect/certs"
-        user-info-uri: "http://keycloak:8080/realms/kafka-ui/protocol/openid-connect/userinfo"
+        # Server/back-channel addresses. These stay inside the VPC.
+        token-uri: "http://${keycloak_private_ip}:8081/realms/kafka-ui/protocol/openid-connect/token"
+        jwk-set-uri: "http://${keycloak_private_ip}:8081/realms/kafka-ui/protocol/openid-connect/certs"
+        user-info-uri: "http://${keycloak_private_ip}:8081/realms/kafka-ui/protocol/openid-connect/userinfo"
 
         user-name-attribute: preferred_username
         custom-params:
