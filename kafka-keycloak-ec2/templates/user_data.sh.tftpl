@@ -14,7 +14,7 @@ mkdir -p "$STACK_DIR"
 ###############################################################################
 
 # Amazon Linux 2023 includes Docker in its normal package repositories.
-dnf install -y docker curl
+dnf install -y docker 
 
 # Make Docker start now and after every EC2 reboot.
 systemctl enable docker
