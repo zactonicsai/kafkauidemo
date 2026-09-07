@@ -6,3 +6,5 @@ kafka-aws/DS_Store
 *.info
 *.out
 .DS_Store
+kafka-keycloak-ec2/dev.tfvar
+vpcdemo/terraform.tfstate.backup

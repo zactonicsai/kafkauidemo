@@ -259,28 +259,35 @@ locals {
 }
 
 ###############################################################################
-# EC2
+# EC2 LAUNCH TEMPLATE
 ###############################################################################
 
-resource "aws_instance" "stack" {
-  ami                    = data.aws_ssm_parameter.al2023.value
+# Keep the EC2 definition in a Launch Template.  This makes the machine setup
+# reusable later if you decide to put it behind an Auto Scaling Group.
+resource "aws_launch_template" "stack" {
+  name_prefix            = "${var.project_name}-"
+  image_id               = data.aws_ssm_parameter.al2023.value
   instance_type          = var.instance_type
-  subnet_id              = aws_subnet.public.id
+  update_default_version = true
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ec2.name
+  }
+
   vpc_security_group_ids = [aws_security_group.stack.id]
-  iam_instance_profile   = aws_iam_instance_profile.ec2.name
 
-  # Give the host immediate Internet access during first boot. The Elastic IP
-  # is attached immediately afterward and becomes the stable public address.
-  associate_public_ip_address = true
+  # Launch Templates expect user_data to already be base64 encoded.
+  user_data = base64encode(local.user_data)
 
-  user_data                   = local.user_data
-  user_data_replace_on_change = true
+  block_device_mappings {
+    device_name = "/dev/xvda"
 
-  root_block_device {
-    volume_type           = "gp3"
-    volume_size           = 30
-    encrypted             = true
-    delete_on_termination = true
+    ebs {
+      volume_type           = "gp3"
+      volume_size           = 30
+      encrypted             = true
+      delete_on_termination = true
+    }
   }
 
   metadata_options {
@@ -288,6 +295,43 @@ resource "aws_instance" "stack" {
     http_tokens   = "required"
   }
 
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = {
+      Name = "${var.project_name}-ec2"
+    }
+  }
+
+  tag_specifications {
+    resource_type = "volume"
+
+    tags = {
+      Name = "${var.project_name}-root-volume"
+    }
+  }
+
+  tags = {
+    Name = "${var.project_name}-launch-template"
+  }
+}
+
+###############################################################################
+# EC2 INSTANCE FROM THE LAUNCH TEMPLATE
+###############################################################################
+
+resource "aws_instance" "stack" {
+  subnet_id                   = aws_subnet.public.id
+  associate_public_ip_address = true
+
+  launch_template {
+    id      = aws_launch_template.stack.id
+    version = tostring(aws_launch_template.stack.latest_version)
+  }
+
+  # Changing the Launch Template creates a new LT version.  Referencing the
+  # numeric latest_version here makes Terraform replace the EC2 instance so the
+  # new boot configuration is actually applied.
   tags = {
     Name = "${var.project_name}-ec2"
   }
@@ -306,6 +350,16 @@ resource "aws_eip_association" "stack" {
 ###############################################################################
 # OUTPUTS
 ###############################################################################
+
+output "launch_template_id" {
+  value       = aws_launch_template.stack.id
+  description = "EC2 Launch Template used by the lab instance."
+}
+
+output "instance_id" {
+  value       = aws_instance.stack.id
+  description = "EC2 instance created from the Launch Template."
+}
 
 output "public_ip" {
   value       = aws_eip.stack.public_ip

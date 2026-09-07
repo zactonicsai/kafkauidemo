@@ -127,7 +127,7 @@ AWS charges for public IPv4 addresses, including Elastic IP addresses, so destro
 
 # 4. AWS resources Terraform creates
 
-Terraform creates:
+Terraform now uses an **EC2 Launch Template**. The Launch Template holds the machine settings such as the AMI, instance size, security group, IAM instance profile, disk, metadata settings, and startup script.
 
 ```text
 VPC
@@ -140,13 +140,19 @@ VPC
       |
       +-- EC2 Security Group
       |
-      +-- EC2 t3.medium
+      +-- EC2 Launch Template
+      |    |
+      |    +-- Amazon Linux 2023 AMI
+      |    +-- t3.medium by default
+      |    +-- 30 GB gp3 root disk
+      |    +-- IAM instance profile
+      |    +-- Docker bootstrap user-data
+      |
+      +-- EC2 instance created from Launch Template
            |
            +-- Elastic IP
            |
-           +-- IAM role for SSM
-           |
-           +-- Docker
+           +-- Docker service
                 |
                 +-- Kafka
                 +-- Kafka UI
@@ -155,11 +161,20 @@ VPC
 
 It also creates:
 
+- An EC2 Launch Template
 - An EC2 IAM role
 - An EC2 instance profile
 - The `AmazonSSMManagedInstanceCore` policy attachment
 - Random passwords for the Keycloak administrator and Kafka UI user
 - A random OAuth client secret
+
+Why use a Launch Template here?
+
+- It keeps the EC2 configuration in one reusable AWS object.
+- The same template can later be used by an Auto Scaling Group if you want one.
+- Terraform creates a new Launch Template version when the boot configuration changes.
+- This project points the EC2 instance at the numeric latest template version, so a template change causes Terraform to replace the EC2 instance and actually run the new startup script.
+- The Elastic IP is a separate resource, so Terraform can attach that same stable address to the replacement instance.
 
 ---
 
@@ -185,7 +200,9 @@ kafka-keycloak-ec2/
 
 Creates all AWS infrastructure.
 
-It also renders the Docker Compose and authentication configuration files and sends them to EC2 as cloud-init user data.
+The EC2 configuration is stored in `aws_launch_template.stack`. Terraform then creates one `aws_instance.stack` from that Launch Template.
+
+The file also renders the Docker Compose and authentication configuration files and places them in Launch Template user-data so they are written onto the EC2 instance during first boot.
 
 ## `terraform.tfvars.example`
 
@@ -235,14 +252,36 @@ Identity provider = Keycloak
 
 Runs when EC2 boots.
 
-It:
+It deliberately verifies Docker before starting the application stack:
 
-1. Installs Docker.
-2. Starts Docker.
-3. Installs the Docker Compose plugin.
-4. Writes the generated configuration files to `/opt/kafka-keycloak`.
-5. Pulls the Docker images.
-6. Starts the containers.
+1. Installs Docker and `curl` on Amazon Linux 2023.
+2. Enables `docker.service` so Docker starts after every reboot.
+3. Starts Docker immediately.
+4. Waits until `docker info` succeeds; bootstrap fails if the daemon never becomes ready.
+5. Installs the Docker Compose CLI plugin.
+6. Writes the generated configuration files to `/opt/kafka-keycloak`.
+7. Validates the Compose file with `docker compose config`.
+8. Pulls the Docker images.
+9. Creates `kafka-keycloak-compose.service` in systemd.
+10. Starts that service, which runs `docker compose up -d`.
+11. Verifies both Docker and the Compose service are active.
+
+That extra systemd service is useful because it gives the startup order a simple rule:
+
+```text
+EC2 boot
+   |
+   v
+Docker service
+   |
+   v
+kafka-keycloak-compose.service
+   |
+   v
+Kafka + Keycloak + Kafka UI
+```
+
+The Compose services also use `restart: unless-stopped`, so Docker has two simple protections for reboot recovery: Docker itself is enabled, and the Compose stack has a systemd startup unit.
 
 ---
 
@@ -615,7 +654,33 @@ install the AWS Session Manager plugin on your local computer and run the comman
 
 ---
 
-# 18. Check cloud-init
+# 17A. Verify the Launch Template
+
+Terraform outputs both the Launch Template ID and the instance ID:
+
+```bash
+terraform output -raw launch_template_id
+terraform output -raw instance_id
+```
+
+You can verify them with AWS CLI:
+
+```bash
+aws ec2 describe-launch-templates \
+  --region us-east-1 \
+  --launch-template-ids "$(terraform output -raw launch_template_id)"
+```
+
+```bash
+aws ec2 describe-instances \
+  --region us-east-1 \
+  --instance-ids "$(terraform output -raw instance_id)" \
+  --query 'Reservations[0].Instances[0].{InstanceId:InstanceId,State:State.Name,LaunchTemplate:LaunchTemplate}'
+```
+
+---
+
+# 18. Check first-boot setup and Docker
 
 After connecting with SSM:
 
@@ -629,17 +694,43 @@ To wait for first-boot configuration to finish:
 sudo cloud-init status --wait
 ```
 
-View the startup log:
+The normal cloud-init log is:
 
 ```bash
-sudo less /var/log/cloud-init-output.log
+sudo tail -200 /var/log/cloud-init-output.log
 ```
 
-Follow it live:
+This project also writes a shorter dedicated bootstrap log:
 
 ```bash
-sudo tail -f /var/log/cloud-init-output.log
+sudo tail -200 /var/log/kafka-keycloak-bootstrap.log
 ```
+
+Verify Docker itself:
+
+```bash
+sudo systemctl status docker --no-pager
+sudo systemctl is-enabled docker
+sudo systemctl is-active docker
+sudo docker info
+```
+
+Expected important results:
+
+```text
+enabled
+active
+```
+
+Verify the Compose startup service:
+
+```bash
+sudo systemctl status kafka-keycloak-compose.service --no-pager
+sudo systemctl is-enabled kafka-keycloak-compose.service
+sudo systemctl is-active kafka-keycloak-compose.service
+```
+
+After an EC2 reboot you should not have to manually run `docker compose up -d`; systemd starts Docker first and then starts the Compose stack.
 
 ---
 
@@ -1067,39 +1158,67 @@ Change it back to your `/32` once you know the correct address.
 
 # 39. Troubleshooting: EC2 exists but containers are missing
 
-Connect with SSM and run:
+Connect with SSM and start with the two boot logs:
 
 ```bash
 sudo cloud-init status
 sudo tail -200 /var/log/cloud-init-output.log
+sudo tail -200 /var/log/kafka-keycloak-bootstrap.log
 ```
 
-Then:
+Check Docker first:
 
 ```bash
-sudo systemctl status docker
+sudo systemctl status docker --no-pager
+sudo systemctl is-enabled docker
+sudo systemctl is-active docker
+sudo docker info
 ```
 
-Check Docker Compose:
+If Docker is not active:
+
+```bash
+sudo systemctl enable --now docker
+```
+
+Then check the Compose startup service:
+
+```bash
+sudo systemctl status kafka-keycloak-compose.service --no-pager
+sudo journalctl -u kafka-keycloak-compose.service -n 100 --no-pager
+```
+
+Restart the stack service if needed:
+
+```bash
+sudo systemctl restart kafka-keycloak-compose.service
+```
+
+Check Docker Compose and the generated files:
 
 ```bash
 sudo docker compose version
-```
-
-Check files:
-
-```bash
 sudo ls -la /opt/kafka-keycloak
 ```
 
-Try manually:
+Manual fallback:
 
 ```bash
 cd /opt/kafka-keycloak
 sudo docker compose config
 sudo docker compose pull
 sudo docker compose up -d
+sudo docker compose ps
 ```
+
+If you changed `main.tf`, the Docker boot script, the AMI, or another Launch Template setting, run:
+
+```bash
+terraform plan
+terraform apply
+```
+
+A new Launch Template version should cause Terraform to replace the EC2 instance. The Elastic IP is then associated with the replacement instance.
 
 ---
 
