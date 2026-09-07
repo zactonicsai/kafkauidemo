@@ -1,3 +1,5 @@
 .terraform
 *.hcl
 *.tfstate
+.DS_Store
+kafka-aws/DS_Store
