@@ -16,13 +16,14 @@ auth:
         redirect-uri: "http://${kafka_public_ip}:8080/login/oauth2/code/keycloak"
         authorization-grant-type: authorization_code
 
-        # Browser/front-channel address.
-        authorization-uri: "http://${keycloak_public_ip}:8081/realms/kafka-ui/protocol/openid-connect/auth"
+        # Browser/front-channel login always uses Keycloak HTTPS on the stable EIP.
+        authorization-uri: "https://${keycloak_public_ip}:8443/realms/kafka-ui/protocol/openid-connect/auth"
 
-        # Server/back-channel addresses. These stay inside the VPC.
-        token-uri: "http://${keycloak_private_ip}:8081/realms/kafka-ui/protocol/openid-connect/token"
-        jwk-set-uri: "http://${keycloak_private_ip}:8081/realms/kafka-ui/protocol/openid-connect/certs"
-        user-info-uri: "http://${keycloak_private_ip}:8081/realms/kafka-ui/protocol/openid-connect/userinfo"
+        # Server/back-channel calls stay inside the VPC, but are HTTPS too.
+        # The Keycloak self-signed certificate contains the private IP as a SAN.
+        token-uri: "https://${keycloak_private_ip}:8443/realms/kafka-ui/protocol/openid-connect/token"
+        jwk-set-uri: "https://${keycloak_private_ip}:8443/realms/kafka-ui/protocol/openid-connect/certs"
+        user-info-uri: "https://${keycloak_private_ip}:8443/realms/kafka-ui/protocol/openid-connect/userinfo"
 
         user-name-attribute: preferred_username
         custom-params:

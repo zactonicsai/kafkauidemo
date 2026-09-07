@@ -4,11 +4,13 @@ set -euxo pipefail
 exec > >(tee -a /var/log/kafka-bootstrap.log | logger -t user-data -s 2>/dev/console) 2>&1
 
 STACK_DIR="/opt/kafka-stack"
+TLS_DIR="$STACK_DIR/tls"
 COMPOSE_VERSION="v5.1.4"
-mkdir -p "$STACK_DIR"
+mkdir -p "$STACK_DIR" "$TLS_DIR"
 
 # Amazon Linux 2023 normally already has curl-minimal. Do not install full curl.
-dnf install -y docker
+# openssl is used to retrieve Keycloak's self-signed certificate and build a truststore.
+dnf install -y docker openssl
 if ! command -v curl >/dev/null 2>&1; then
   dnf install -y curl-minimal
 fi
@@ -32,10 +34,72 @@ docker compose version
 
 echo '${docker_compose_b64}' | base64 -d > "$STACK_DIR/docker-compose.yml"
 echo '${kafka_ui_config_b64}' | base64 -d > "$STACK_DIR/kafka-ui.yml"
-chmod 644 "$STACK_DIR/docker-compose.yml"
-# Kafka UI runs as a non-root user in the container. The bind-mounted file
-# must therefore be readable by that user. 0644 is intentional for this lab.
-chmod 644 "$STACK_DIR/kafka-ui.yml"
+chmod 644 "$STACK_DIR/docker-compose.yml" "$STACK_DIR/kafka-ui.yml"
+
+###############################################################################
+# TRUST KEYCLOAK'S SELF-SIGNED HTTPS CERTIFICATE
+#
+# Kafka UI makes HTTPS OIDC calls to Keycloak's private IP. Retrieve the
+# certificate presented by Keycloak, then create a PKCS12 truststore for Java.
+###############################################################################
+
+KEYCLOAK_PRIVATE_IP="${keycloak_private_ip}"
+
+for i in {1..90}; do
+  if timeout 5 openssl s_client \
+      -connect "$KEYCLOAK_PRIVATE_IP:8443" \
+      -servername "$KEYCLOAK_PRIVATE_IP" \
+      -showcerts </dev/null 2>/dev/null \
+      | openssl x509 -outform PEM > "$TLS_DIR/keycloak.crt" 2>/dev/null; then
+    if test -s "$TLS_DIR/keycloak.crt"; then
+      echo "Retrieved Keycloak HTTPS certificate."
+      break
+    fi
+  fi
+  rm -f "$TLS_DIR/keycloak.crt"
+  sleep 2
+done
+
+test -s "$TLS_DIR/keycloak.crt"
+
+# Verify the private IP is one of the certificate SANs.
+openssl x509 -in "$TLS_DIR/keycloak.crt" -noout -subject -issuer -dates -ext subjectAltName
+
+# Build a Java PKCS12 truststore. OpenSSL can create a PKCS12 containing only
+# certificate bags, but the Java PKCS12 provider may report that as 0 trusted
+# entries. Use keytool from the same Kafka UI image so Java sees a real
+# trustedCertEntry.
+docker pull ghcr.io/kafbat/kafka-ui:v1.5.0
+rm -f "$TLS_DIR/keycloak-truststore.p12"
+docker run --rm \
+  --user 0:0 \
+  --entrypoint keytool \
+  -v "$TLS_DIR:/work" \
+  ghcr.io/kafbat/kafka-ui:v1.5.0 \
+  -importcert -noprompt \
+  -alias keycloak \
+  -file /work/keycloak.crt \
+  -keystore /work/keycloak-truststore.p12 \
+  -storetype PKCS12 \
+  -storepass changeit
+
+chmod 644 "$TLS_DIR/keycloak.crt" "$TLS_DIR/keycloak-truststore.p12"
+
+# Fail early if Java cannot see the trusted certificate entry.
+docker run --rm \
+  --entrypoint keytool \
+  -v "$TLS_DIR:/work:ro" \
+  ghcr.io/kafbat/kafka-ui:v1.5.0 \
+  -list \
+  -keystore /work/keycloak-truststore.p12 \
+  -storetype PKCS12 \
+  -storepass changeit \
+  -alias keycloak
+
+# Confirm TLS verification works before starting Kafka UI.
+curl --cacert "$TLS_DIR/keycloak.crt" -fsS \
+  "https://$KEYCLOAK_PRIVATE_IP:8443/realms/kafka-ui/.well-known/openid-configuration" \
+  >/dev/null
 
 cd "$STACK_DIR"
 docker compose config

@@ -223,17 +223,17 @@ resource "aws_security_group" "keycloak" {
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description = "Keycloak browser/admin access"
-    from_port   = 8081
-    to_port     = 8081
+    description = "Keycloak HTTPS browser/admin access"
+    from_port   = 8443
+    to_port     = 8443
     protocol    = "tcp"
     cidr_blocks = [var.allowed_cidr]
   }
 
   ingress {
-    description     = "Kafka UI private OIDC back-channel"
-    from_port       = 8081
-    to_port         = 8081
+    description     = "Kafka UI private OIDC HTTPS back-channel"
+    from_port       = 8443
+    to_port         = 8443
     protocol        = "tcp"
     security_groups = [aws_security_group.kafka.id]
   }
@@ -325,8 +325,8 @@ locals {
     kafka_ui_secret   = random_password.kafka_ui_client_secret.result
   })
 
-  # Kafka UI uses the public Keycloak address for browser authorization and the
-  # Keycloak EC2 private address for server-to-server token/JWK/userinfo calls.
+  # Kafka UI uses HTTPS for every Keycloak OIDC endpoint. Browser authorization uses
+  # the stable Keycloak EIP; token/JWK/userinfo calls use the Keycloak private IP.
   kafka_ui_config = templatefile("${path.module}/files/kafka-ui.yml.tftpl", {
     kafka_public_ip          = aws_eip.kafka.public_ip
     keycloak_public_ip       = aws_eip.keycloak.public_ip
@@ -345,11 +345,13 @@ locals {
   kafka_user_data = templatefile("${path.module}/templates/user_data.sh.tftpl", {
     docker_compose_b64  = base64encode(local.kafka_compose)
     kafka_ui_config_b64 = base64encode(local.kafka_ui_config)
+    keycloak_private_ip = aws_instance.keycloak.private_ip
   })
 
   keycloak_user_data = templatefile("${path.module}/templates/keycloak_user_data.sh.tftpl", {
     keycloak_compose_b64 = base64encode(local.keycloak_compose)
     keycloak_realm_b64   = base64encode(local.keycloak_realm)
+    keycloak_public_ip   = aws_eip.keycloak.public_ip
   })
 }
 
@@ -560,22 +562,22 @@ output "kafka_ui_url" {
 }
 
 output "keycloak_url" {
-  value       = "http://${aws_eip.keycloak.public_ip}:8081"
-  description = "Keycloak base URL."
+  value       = "https://${aws_eip.keycloak.public_ip}:8443"
+  description = "Keycloak HTTPS base URL. Uses the lab self-signed certificate."
 }
 
 output "keycloak_admin_url" {
-  value       = "http://${aws_eip.keycloak.public_ip}:8081/admin/"
-  description = "Keycloak Admin Console."
+  value       = "https://${aws_eip.keycloak.public_ip}:8443/admin/"
+  description = "Keycloak HTTPS Admin Console."
 }
 
 output "keycloak_metrics_url" {
-  value       = "http://${aws_eip.keycloak.public_ip}:9000/metrics"
+  value       = "https://${aws_eip.keycloak.public_ip}:9000/metrics"
   description = "Keycloak metrics endpoint. Restricted by allowed_cidr."
 }
 
 output "keycloak_health_url" {
-  value       = "http://${aws_eip.keycloak.public_ip}:9000/health/ready"
+  value       = "https://${aws_eip.keycloak.public_ip}:9000/health/ready"
   description = "Keycloak readiness endpoint. Restricted by allowed_cidr."
 }
 

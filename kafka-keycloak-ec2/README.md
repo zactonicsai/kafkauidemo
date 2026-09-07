@@ -4,6 +4,44 @@ This project creates a small AWS lab where **Keycloak runs on its own EC2 instan
 
 The split is intentional. Kafka and Keycloak are both Java applications and can compete for memory when they share one small EC2 instance. Giving Keycloak its own EC2 makes Docker restarts and memory troubleshooting much easier.
 
+## HTTPS / TLS design used by this lab
+
+Keycloak is **HTTPS-only**. It listens on TCP `8443`; there is no plaintext Keycloak listener. Because this lab intentionally has no DNS domain, Keycloak bootstraps a self-signed certificate whose Subject Alternative Names contain the stable Keycloak Elastic IP, the EC2 private VPC IP, `127.0.0.1`, and `localhost`.
+
+Kafka UI talks to Keycloak over `https://KEYCLOAK_PRIVATE_IP:8443`. During Kafka EC2 bootstrap, the script retrieves the Keycloak certificate, verifies it, builds `/opt/kafka-stack/tls/keycloak-truststore.p12`, and mounts that truststore into Kafka UI. This prevents the common Java error `PKIX path building failed`. The browser uses `https://KEYCLOAK_EIP:8443`; because the certificate is self-signed, a browser will show a certificate warning until you explicitly trust the lab certificate. For production, use a DNS name and a certificate from a trusted CA instead of this lab certificate.
+
+Keycloak health and metrics stay on management port `9000`, but that interface also uses HTTPS by inheriting the main TLS configuration.
+
+For strict local verification on the Keycloak EC2, prefer the generated certificate over `-k`:
+
+```bash
+curl --cacert /opt/keycloak-stack/tls/keycloak.crt \
+  https://127.0.0.1:8443/realms/kafka-ui/.well-known/openid-configuration
+
+curl --cacert /opt/keycloak-stack/tls/keycloak.crt \
+  https://127.0.0.1:9000/health/ready
+```
+
+The README sometimes uses `curl -k` as a quick lab diagnostic. `-k` disables certificate verification and should not be copied into production automation.
+
+### Applying the HTTPS conversion to an existing deployment
+
+Launch Template user-data runs on first boot. Updating `main.tf` alone does not rewrite the Compose files or create TLS/truststore files on EC2 instances that already exist. For this lab, replace both application instances while keeping the Terraform-managed Elastic IPs:
+
+```bash
+terraform fmt
+terraform validate
+terraform plan \
+  -replace=aws_instance.keycloak \
+  -replace=aws_instance.kafka
+
+terraform apply \
+  -replace=aws_instance.keycloak \
+  -replace=aws_instance.kafka
+```
+
+Terraform creates Keycloak first, associates its stable Elastic IP, and then creates the Kafka host. Kafka bootstrap waits for `KEYCLOAK_PRIVATE_IP:8443`, retrieves the presented certificate, creates a Java PKCS12 truststore, verifies the OIDC discovery endpoint, and only then starts Kafka UI.
+
 ---
 
 ## 1. Architecture
@@ -13,7 +51,7 @@ The split is intentional. Kafka and Keycloak are both Java applications and can 
                              |
               +--------------+--------------+
               |                             |
-              | TCP 8080                    | TCP 8081
+              | TCP 8080                    | TCP 8443
               v                             v
      +--------------------+        +--------------------+
      | Kafka EC2          |        | Keycloak EC2       |
@@ -26,14 +64,14 @@ The split is intentional. Kafka and Keycloak are both Java applications and can 
      +---------+----------+        +----------+---------+
                |                              ^
                | OIDC token/JWK/userinfo      |
-               | private VPC TCP 8081         |
+               | private VPC TCP 8443         |
                +------------------------------+
 ```
 
 ### Public traffic
 
 - Kafka UI: `http://KAFKA_EIP:8080`
-- Keycloak: `http://KEYCLOAK_EIP:8081`
+- Keycloak: `https://KEYCLOAK_EIP:8443`
 - Kafka port `9092` is **not opened to the Internet**.
 - SSH port `22` is **not opened**.
 - EC2 administration is done through AWS Systems Manager Session Manager.
@@ -438,7 +476,7 @@ Your browser needs to see Keycloak.
 Kafka UI sends the browser to:
 
 ```text
-http://KEYCLOAK_PUBLIC_IP:8081/realms/kafka-ui/protocol/openid-connect/auth
+https://KEYCLOAK_PUBLIC_IP:8443/realms/kafka-ui/protocol/openid-connect/auth
 ```
 
 The user logs in.
@@ -458,7 +496,7 @@ After receiving the authorization code, Kafka UI must exchange it for tokens.
 Kafka UI does that directly against Keycloak's private VPC IP:
 
 ```text
-http://KEYCLOAK_PRIVATE_IP:8081/realms/kafka-ui/protocol/openid-connect/token
+https://KEYCLOAK_PRIVATE_IP:8443/realms/kafka-ui/protocol/openid-connect/token
 ```
 
 It also uses the private address for:
@@ -496,13 +534,13 @@ There is deliberately no public inbound rule for:
 Inbound:
 
 ```text
-TCP 8081 from allowed_cidr
+TCP 8443 from allowed_cidr
 ```
 
 and:
 
 ```text
-TCP 8081 from the Kafka EC2 security group
+TCP 8443 from the Kafka EC2 security group
 ```
 
 That second rule is what allows Kafka UI to call Keycloak privately.
@@ -571,14 +609,14 @@ sudo docker compose ps
 Check local HTTP connectivity:
 
 ```bash
-curl -i http://127.0.0.1:8081/
+curl -k -i https://127.0.0.1:8443/
 ```
 
 Check the realm discovery URL:
 
 ```bash
-curl -s \
-  http://127.0.0.1:8081/realms/kafka-ui/.well-known/openid-configuration
+curl -k -s \
+  https://127.0.0.1:8443/realms/kafka-ui/.well-known/openid-configuration
 ```
 
 If this works, Docker and Keycloak are working locally.
@@ -682,14 +720,14 @@ Suppose it returns:
 On the Kafka EC2 run:
 
 ```bash
-curl -i http://10.40.1.25:8081/
+curl -k -i https://10.40.1.25:8443/
 ```
 
 Then test OIDC discovery:
 
 ```bash
-curl -s \
-  http://10.40.1.25:8081/realms/kafka-ui/.well-known/openid-configuration
+curl -k -s \
+  https://10.40.1.25:8443/realms/kafka-ui/.well-known/openid-configuration
 ```
 
 If the local Keycloak test works on Keycloak EC2 but this private-IP test fails from Kafka EC2, focus on:
@@ -716,7 +754,7 @@ sudo ss -lntp
 You should see a listener associated with Docker on port:
 
 ```text
-8081
+8443
 ```
 
 Also run:
@@ -728,13 +766,13 @@ sudo docker port keycloak
 Expected approximately:
 
 ```text
-8080/tcp -> 0.0.0.0:8081
+8443/tcp -> 0.0.0.0:8443
 ```
 
 The important part is:
 
 ```text
-0.0.0.0:8081
+0.0.0.0:8443
 ```
 
 That means the container's port is published on the EC2 network interfaces, not only on localhost.
@@ -774,13 +812,13 @@ This is a very useful troubleshooting distinction.
 If this works on the EC2:
 
 ```bash
-curl http://127.0.0.1:8081
+curl -k https://127.0.0.1:8443
 ```
 
 but this fails from your laptop:
 
 ```text
-http://KEYCLOAK_PUBLIC_IP:8081
+https://KEYCLOAK_PUBLIC_IP:8443
 ```
 
 then the application itself is probably okay.
@@ -807,13 +845,13 @@ Do not use a service's own Elastic IP as your primary local health check.
 For example, on Keycloak EC2 prefer:
 
 ```bash
-curl http://127.0.0.1:8081
+curl -k https://127.0.0.1:8443
 ```
 
 instead of:
 
 ```bash
-curl http://KEYCLOAK_EIP:8081
+curl -k https://KEYCLOAK_EIP:8443
 ```
 
 The localhost check answers a simpler question:
@@ -1003,7 +1041,7 @@ This project uses Elastic IPs to keep those URLs stable.
 Keycloak identifies itself using the configured public hostname:
 
 ```text
-http://KEYCLOAK_EIP:8081
+https://KEYCLOAK_EIP:8443
 ```
 
 The browser should always use that public address.
@@ -1101,7 +1139,7 @@ sudo docker exec kafka \
 First verify Keycloak directly in a browser:
 
 ```text
-http://KEYCLOAK_EIP:8081
+https://KEYCLOAK_EIP:8443
 ```
 
 Then open Kafka UI:
@@ -1134,7 +1172,7 @@ terraform output -raw keycloak_private_ip
 From Kafka EC2:
 
 ```bash
-curl -v http://KEYCLOAK_PRIVATE_IP:8081/
+curl -k -v https://KEYCLOAK_PRIVATE_IP:8443/
 ```
 
 If that fails, check Keycloak's SG:
@@ -1145,12 +1183,12 @@ aws ec2 describe-security-groups \
   --group-ids YOUR_KEYCLOAK_SECURITY_GROUP_ID
 ```
 
-There should be an inbound rule allowing TCP `8081` from the **Kafka security group**.
+There should be an inbound rule allowing TCP `8443` from the **Kafka security group**.
 
 Also verify on Keycloak EC2:
 
 ```bash
-sudo ss -lntp | grep 8081
+sudo ss -lntp | grep 8443
 ```
 
 ---
@@ -1230,7 +1268,7 @@ curl -I http://127.0.0.1:8080
 Keycloak:
 
 ```bash
-curl -I http://127.0.0.1:8081
+curl -k -I https://127.0.0.1:8443
 ```
 
 ## C. Is Docker publishing the port?
@@ -1362,9 +1400,9 @@ When something is broken, use this order.
 
 ```bash
 sudo docker ps -a
-curl -I http://127.0.0.1:8081
+curl -k -I https://127.0.0.1:8443
 sudo docker logs --tail=100 keycloak
-sudo ss -lntp | grep 8081
+sudo ss -lntp | grep 8443
 ```
 
 ### Kafka EC2
@@ -1386,7 +1424,7 @@ KEYCLOAK_PRIVATE_IP=$(terraform output -raw keycloak_private_ip)
 If running this command from your local Terraform directory, use the returned address when connected to Kafka EC2:
 
 ```bash
-curl -v http://KEYCLOAK_PRIVATE_IP:8081/realms/kafka-ui/.well-known/openid-configuration
+curl -k -v https://KEYCLOAK_PRIVATE_IP:8443/realms/kafka-ui/.well-known/openid-configuration
 ```
 
 If localhost works but private networking does not, inspect AWS networking.
@@ -1583,7 +1621,7 @@ You should see Keycloak running as UID `1000`, and `/opt/keycloak/data/h2` shoul
 Then test locally on the Keycloak EC2:
 
 ```bash
-curl -i http://127.0.0.1:8081/realms/kafka-ui/.well-known/openid-configuration
+curl -k -i https://127.0.0.1:8443/realms/kafka-ui/.well-known/openid-configuration
 ```
 
 A successful response proves the container and realm are running before you troubleshoot security groups, Elastic IPs, Kafka UI, or browser OIDC redirects.
@@ -1641,14 +1679,14 @@ sudo docker exec kafka-ui sh -c 'id; ls -l /config.yml; head -5 /config.yml'
 
 The file should be readable. Do **not** fix this by running Kafka UI as root unless you have a specific reason.
 
-# Keycloak HTTP, Health, and Metrics
+# Keycloak HTTPS, Health, and Metrics
 
-This lab explicitly enables Keycloak HTTP for the browser/OIDC endpoints and enables the Keycloak management interface for health and metrics.
+This lab disables plaintext Keycloak HTTP and uses HTTPS on port 8443 for browser/OIDC endpoints. The Keycloak management interface on port 9000 inherits the same TLS certificate.
 
-Main Keycloak HTTP listener:
+Main Keycloak HTTPS listener:
 
 ```text
-EC2 TCP 8081 -> container TCP 8080
+EC2 TCP 8443 -> container TCP 8443
 ```
 
 Keycloak management interface:
@@ -1660,50 +1698,51 @@ EC2 TCP 9000 -> container TCP 9000
 The Compose environment includes:
 
 ```yaml
-KC_HTTP_ENABLED: "true"
-KC_HTTP_HOST: "0.0.0.0"
-KC_HTTP_PORT: "8080"
+KC_HTTP_ENABLED: "false"
+KC_HTTPS_PORT: "8443"
+KC_HTTPS_CERTIFICATE_FILE: "/opt/keycloak/conf/tls/keycloak.crt"
+KC_HTTPS_CERTIFICATE_KEY_FILE: "/opt/keycloak/conf/tls/keycloak.key"
 KC_HEALTH_ENABLED: "true"
 KC_METRICS_ENABLED: "true"
-KC_HTTP_MANAGEMENT_SCHEME: "http"
+KC_HTTP_MANAGEMENT_SCHEME: "inherited"
 KC_HTTP_MANAGEMENT_HOST: "0.0.0.0"
 KC_HTTP_MANAGEMENT_PORT: "9000"
 ```
 
 Keycloak 26 exposes health and metrics on the management interface, which uses port `9000` by default when enabled.
 
-## Test Keycloak HTTP locally
+## Test Keycloak HTTPS locally
 
 On the Keycloak EC2:
 
 ```bash
-curl -i http://127.0.0.1:8081/
+curl -k -i https://127.0.0.1:8443/
 ```
 
 Test the realm discovery endpoint:
 
 ```bash
-curl -s \
-  http://127.0.0.1:8081/realms/kafka-ui/.well-known/openid-configuration
+curl -k -s \
+  https://127.0.0.1:8443/realms/kafka-ui/.well-known/openid-configuration
 ```
 
 ## Test Keycloak readiness
 
 ```bash
-curl -i http://127.0.0.1:9000/health/ready
+curl -k -i https://127.0.0.1:9000/health/ready
 ```
 
 Also useful:
 
 ```bash
-curl -i http://127.0.0.1:9000/health/live
-curl -i http://127.0.0.1:9000/health/started
+curl -k -i https://127.0.0.1:9000/health/live
+curl -k -i https://127.0.0.1:9000/health/started
 ```
 
 ## Test Keycloak metrics
 
 ```bash
-curl http://127.0.0.1:9000/metrics | head -50
+curl -k https://127.0.0.1:9000/metrics | head -50
 ```
 
 From your workstation, when your address is included in `allowed_cidr`:
@@ -1716,8 +1755,8 @@ terraform output -raw keycloak_health_url
 Then:
 
 ```bash
-curl "$(terraform output -raw keycloak_health_url)"
-curl "$(terraform output -raw keycloak_metrics_url)" | head -50
+curl -k "$(terraform output -raw keycloak_health_url)"
+curl -k "$(terraform output -raw keycloak_metrics_url)" | head -50
 ```
 
 ## Security note about port 9000
@@ -1735,14 +1774,66 @@ sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 You should see mappings similar to:
 
 ```text
-0.0.0.0:8081->8080/tcp
+0.0.0.0:8443->8443/tcp
 0.0.0.0:9000->9000/tcp
 ```
 
 And on the host:
 
 ```bash
-sudo ss -lntp | egrep ':8081|:9000'
+sudo ss -lntp | egrep ':8443|:9000'
 ```
 
-If `127.0.0.1:8081` works but the public `:8081` URL does not, troubleshoot the EC2 security group, route table, Internet Gateway, and Elastic IP association. If `127.0.0.1:9000` works but the public metrics URL does not, check the security-group `9000` rule and `allowed_cidr`.
+If local HTTPS on `127.0.0.1:8443` works but the public `:8443` URL does not, troubleshoot the EC2 security group, route table, Internet Gateway, and Elastic IP association. If `127.0.0.1:9000` works but the public metrics URL does not, check the security-group `9000` rule and `allowed_cidr`.
+
+## HTTPS-specific gotchas and troubleshooting
+
+### Browser says the certificate is not trusted
+
+That is expected for this no-domain lab because the generated Keycloak certificate is self-signed. The connection is encrypted, but your workstation does not automatically trust the issuer. Inspect the certificate before accepting the browser warning. For production, use a real DNS name and a certificate issued by a trusted CA.
+
+### Kafka UI logs show `PKIX path building failed`
+
+Check the truststore on the Kafka EC2:
+
+```bash
+cd /opt/kafka-stack
+ls -l tls/keycloak.crt tls/keycloak-truststore.p12
+sudo docker run --rm \
+  --entrypoint keytool \
+  -v "$PWD/tls:/work:ro" \
+  ghcr.io/kafbat/kafka-ui:v1.5.0 \
+  -list -keystore /work/keycloak-truststore.p12 \
+  -storetype PKCS12 -storepass changeit -alias keycloak
+```
+
+Also confirm the private-IP certificate SAN:
+
+```bash
+openssl x509 -in /opt/kafka-stack/tls/keycloak.crt \
+  -noout -subject -issuer -ext subjectAltName
+```
+
+The Keycloak private IP used by Terraform should appear in the SAN list.
+
+### Test Kafka EC2 to Keycloak with certificate verification
+
+```bash
+KEYCLOAK_PRIVATE_IP=$(terraform output -raw keycloak_private_ip)
+# Run the next command on the Kafka EC2, substituting the private IP if needed.
+curl --cacert /opt/kafka-stack/tls/keycloak.crt \
+  https://KEYCLOAK_PRIVATE_IP:8443/realms/kafka-ui/.well-known/openid-configuration
+```
+
+Do not use HTTP as a fallback. If HTTPS fails, inspect port `8443`, the Keycloak certificate SANs, the Keycloak security group, and the Kafka UI truststore.
+
+### Verify Keycloak has no plaintext application listener
+
+On the Keycloak EC2:
+
+```bash
+sudo docker ps --format 'table {{.Names}}\t{{.Ports}}'
+sudo ss -lntp | egrep ':8443|:9000|:8080|:8081'
+```
+
+The intended published Keycloak ports are `8443` and `9000`. There should be no host-published Keycloak application port `8080` or `8081`.

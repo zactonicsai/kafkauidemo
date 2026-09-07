@@ -10,28 +10,32 @@ services:
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: "${keycloak_admin_username}"
       KC_BOOTSTRAP_ADMIN_PASSWORD: "${keycloak_admin_password}"
-      KC_HOSTNAME: "http://${keycloak_public_ip}:8081"
-      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
-      # Explicitly enable the main HTTP listener used for OIDC/Admin UI.
-      KC_HTTP_ENABLED: "true"
-      KC_HTTP_HOST: "0.0.0.0"
-      KC_HTTP_PORT: "8080"
 
-      # Enable Keycloak observability endpoints on the management interface.
-      # Keycloak 26 uses port 9000 for health and metrics by default.
+      # Public issuer/redirect base. All Keycloak browser and OIDC URLs use HTTPS 8443.
+      KC_HOSTNAME: "https://${keycloak_public_ip}:8443"
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+
+      # Disable plaintext HTTP and enable Keycloak's HTTPS listener on 8443.
+      KC_HTTP_ENABLED: "false"
+      KC_HTTPS_PORT: "8443"
+      KC_HTTPS_CERTIFICATE_FILE: "/opt/keycloak/conf/tls/keycloak.crt"
+      KC_HTTPS_CERTIFICATE_KEY_FILE: "/opt/keycloak/conf/tls/keycloak.key"
+      KC_HTTPS_PROTOCOLS: "TLSv1.3,TLSv1.2"
+
+      # Health and metrics remain on the management port, but inherit HTTPS/TLS.
       KC_HEALTH_ENABLED: "true"
       KC_METRICS_ENABLED: "true"
-      KC_HTTP_MANAGEMENT_SCHEME: "http"
+      KC_HTTP_MANAGEMENT_SCHEME: "inherited"
       KC_HTTP_MANAGEMENT_HOST: "0.0.0.0"
       KC_HTTP_MANAGEMENT_PORT: "9000"
 
       JAVA_OPTS_KC_HEAP: "-XX:InitialRAMPercentage=20 -XX:MaxRAMPercentage=60"
     ports:
-      - "0.0.0.0:8081:8080"
+      - "0.0.0.0:8443:8443"
       - "0.0.0.0:9000:9000"
     volumes:
-      # Bind the H2 data directory to a host path that user-data owns as UID 1000.
-      # The official Keycloak container runs as UID 1000, so this avoids H2
-      # AccessDeniedException errors without running Keycloak as root.
+      # Bind the H2 data directory to a host path owned by Keycloak UID 1000.
       - ./keycloak-data/h2:/opt/keycloak/data/h2
       - ./keycloak-realm.json:/opt/keycloak/data/import/kafka-ui-realm.json:ro
+      - ./tls/keycloak.crt:/opt/keycloak/conf/tls/keycloak.crt:ro
+      - ./tls/keycloak.key:/opt/keycloak/conf/tls/keycloak.key:ro
