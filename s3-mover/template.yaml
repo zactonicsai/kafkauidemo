@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SQS-triggered Lambda that moves a file between S3 buckets (adding a short date
+  to the file name), running entirely on a private network via VPC endpoints.
+  Includes a simple sender Lambda that publishes the move request to SQS.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that hosts the private subnets
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets (no internet/NAT required) for the Lambdas
+  PrivateRouteTableIds:
+    Type: CommaDelimitedList
+    Description: Route tables of those subnets (needed for the S3 gateway endpoint)
+  SourceBucketName:
+    Type: String
+  DestinationBucketName:
+    Type: String
+  DefaultFileName:
+    Type: String
+    Default: reports/sales.csv
+    Description: Fallback file_name used by the sender Lambda when the event omits it
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 60
+    MemorySize: 256
+    VpcConfig:
+      SecurityGroupIds: [!Ref LambdaSecurityGroup]
+      SubnetIds: !Ref PrivateSubnetIds
+
+Resources:
+  # ---------------------------------------------------------------- Network
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda egress to VPC endpoints only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0   # only reachable targets are the endpoints below (no NAT/IGW)
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS from the Lambdas to the SQS interface endpoint
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: !Ref PrivateRouteTableIds
+
+  SqsInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.sqs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # ---------------------------------------------------------------- Storage
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SourceBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DestinationBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  # ---------------------------------------------------------------- Messaging
+  MoveFileDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-move-file-dlq
+      MessageRetentionPeriod: 1209600   # 14 days
+      SqsManagedSseEnabled: true
+
+  MoveFileQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-move-file
+      VisibilityTimeout: 360            # >= 6 x Lambda timeout
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MoveFileDLQ.Arn
+        maxReceiveCount: 3
+
+  # Only allow SendMessage from inside this VPC endpoint (keeps the queue private)
+  MoveFileQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref MoveFileQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenySendOutsideVpce
+            Effect: Deny
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt MoveFileQueue.Arn
+            Condition:
+              StringNotEquals:
+                aws:SourceVpce: !Ref SqsInterfaceEndpoint
+
+  # ---------------------------------------------------------------- Lambdas
+  MoveFileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-move-file
+      CodeUri: move_file/
+      Handler: app.handler
+      Description: Consumes SQS messages and moves/renames S3 objects
+      Environment:
+        Variables:
+          DATE_FORMAT: "%Y%m%d"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [s3:GetObject, s3:DeleteObject]
+              Resource: !Sub arn:aws:s3:::${SourceBucketName}/*
+            - Effect: Allow
+              Action: [s3:PutObject]
+              Resource: !Sub arn:aws:s3:::${DestinationBucketName}/*
+            - Effect: Allow
+              Action: [s3:ListBucket]
+              Resource:
+                - !Sub arn:aws:s3:::${SourceBucketName}
+                - !Sub arn:aws:s3:::${DestinationBucketName}
+      Events:
+        SqsTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MoveFileQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  SendMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-send-message
+      CodeUri: send_message/
+      Handler: app.handler
+      Description: Simple event Lambda that publishes a move request to SQS
+      Timeout: 15
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref MoveFileQueue
+          SOURCE_BUCKET: !Ref SourceBucketName
+          DESTINATION_BUCKET: !Ref DestinationBucketName
+          DEFAULT_FILE_NAME: !Ref DefaultFileName
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt MoveFileQueue.QueueName
+      Events:
+        # Optional nightly trigger; enable it or just invoke the function directly.
+        NightlySchedule:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: cron(0 2 * * ? *)
+            State: DISABLED
+
+Outputs:
+  QueueUrl:
+    Value: !Ref MoveFileQueue
+  MoveFileFunctionName:
+    Value: !Ref MoveFileFunction
+  SendMessageFunctionName:
+    Value: !Ref SendMessageFunction
