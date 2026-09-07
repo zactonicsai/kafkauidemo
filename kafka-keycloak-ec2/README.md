@@ -1482,3 +1482,122 @@ terraform apply
 ```
 
 Do not use `destroy` if you have data you need to preserve.
+
+## Keycloak H2 `AccessDeniedException` / restart loop
+
+If Keycloak logs contain errors like:
+
+```text
+AccessDeniedException: /opt/keycloak/data/h2/keycloakdb.trace.db
+Could not open file /opt/keycloak/data/h2/keycloakdb.mv.db
+Failed to obtain JDBC connection
+```
+
+this is a Linux filesystem ownership problem. The official Keycloak container runs as UID `1000` (group `0`). If `/opt/keycloak/data/h2` is mounted from storage that is owned by root and is not writable by UID 1000, H2 cannot create or update its database files and Keycloak exits. Docker then restarts the container because the Compose service uses `restart: unless-stopped`.
+
+This project now avoids that problem by using a bind-mounted host directory:
+
+```text
+/opt/keycloak-stack/keycloak-data/h2
+        |
+        +--> /opt/keycloak/data/h2 inside the container
+```
+
+The Keycloak bootstrap creates the directory and applies:
+
+```bash
+sudo chown -R 1000:0 /opt/keycloak-stack/keycloak-data
+sudo chmod -R u+rwX,g+rwX /opt/keycloak-stack/keycloak-data
+```
+
+The systemd Compose service re-applies the ownership before every startup. The realm import file is also owned by `1000:0` and mode `0640`, because Keycloak must be able to read it while importing the realm.
+
+### Repair an existing Keycloak EC2 without rebuilding it
+
+If the existing instance is already running the old configuration, connect with SSM:
+
+```bash
+aws ssm start-session \
+  --region us-east-1 \
+  --target $(terraform output -raw keycloak_instance_id)
+```
+
+Then stop the restart loop:
+
+```bash
+cd /opt/keycloak-stack
+sudo docker compose down
+```
+
+Create a writable host data directory:
+
+```bash
+sudo mkdir -p /opt/keycloak-stack/keycloak-data/h2
+sudo chown -R 1000:0 /opt/keycloak-stack/keycloak-data
+sudo chmod -R u+rwX,g+rwX /opt/keycloak-stack/keycloak-data
+```
+
+Make sure the realm file is readable by Keycloak:
+
+```bash
+sudo chown 1000:0 /opt/keycloak-stack/keycloak-realm.json
+sudo chmod 640 /opt/keycloak-stack/keycloak-realm.json
+```
+
+Update the Keycloak volume in `docker-compose.yml` to:
+
+```yaml
+volumes:
+  - ./keycloak-data/h2:/opt/keycloak/data/h2
+  - ./keycloak-realm.json:/opt/keycloak/data/import/kafka-ui-realm.json:ro
+```
+
+Remove the old named volume if it is no longer needed. First see its exact name:
+
+```bash
+sudo docker volume ls
+```
+
+Then remove only the old Keycloak H2 volume after the container is down:
+
+```bash
+sudo docker volume rm <old-keycloak-volume-name>
+```
+
+Start Keycloak again:
+
+```bash
+sudo docker compose up -d
+sudo docker compose ps
+sudo docker compose logs -f keycloak
+```
+
+Verify the ownership from inside the container:
+
+```bash
+sudo docker exec keycloak sh -c 'id; ls -ld /opt/keycloak/data/h2; ls -la /opt/keycloak/data/h2'
+```
+
+You should see Keycloak running as UID `1000`, and `/opt/keycloak/data/h2` should be writable by that user.
+
+Then test locally on the Keycloak EC2:
+
+```bash
+curl -i http://127.0.0.1:8081/realms/kafka-ui/.well-known/openid-configuration
+```
+
+A successful response proves the container and realm are running before you troubleshoot security groups, Elastic IPs, Kafka UI, or browser OIDC redirects.
+
+### If you prefer a clean rebuild
+
+Because EC2 user-data normally runs only on first boot, applying a changed Launch Template does not repair an already-running instance automatically. For a lab environment, replace the Keycloak EC2 so the corrected bootstrap runs from the beginning:
+
+```bash
+terraform apply -replace=aws_instance.keycloak
+```
+
+Then watch the bootstrap log through SSM:
+
+```bash
+sudo tail -f /var/log/keycloak-bootstrap.log
+```
