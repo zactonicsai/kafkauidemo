@@ -1,0 +1,41 @@
+#!/bin/bash
+set -euxo pipefail
+
+STACK_DIR="/opt/kafka-keycloak"
+COMPOSE_VERSION="v5.5.0"
+
+mkdir -p "$STACK_DIR"
+
+# Install Docker on Amazon Linux 2023.
+dnf install -y docker curl
+systemctl enable --now docker
+usermod -aG docker ec2-user
+
+# The SSM agent is normally present on Amazon Linux 2023. Start it if available.
+systemctl enable --now amazon-ssm-agent || true
+
+# Install the Docker Compose CLI plugin for all users.
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -fsSL \
+  "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-x86_64" \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+docker compose version
+
+# Terraform rendered each config file and passed it as base64 so quoting inside
+# JSON/YAML does not get damaged by cloud-init or the shell.
+echo '${docker_compose_b64}' | base64 -d > "$STACK_DIR/docker-compose.yml"
+echo '${keycloak_realm_b64}' | base64 -d > "$STACK_DIR/keycloak-realm.json"
+echo '${kafka_ui_config_b64}' | base64 -d > "$STACK_DIR/kafka-ui.yml"
+
+chmod 600 "$STACK_DIR/keycloak-realm.json" "$STACK_DIR/kafka-ui.yml"
+chmod 644 "$STACK_DIR/docker-compose.yml"
+
+cd "$STACK_DIR"
+
+docker compose config
+docker compose pull
+docker compose up -d
+
+docker compose ps

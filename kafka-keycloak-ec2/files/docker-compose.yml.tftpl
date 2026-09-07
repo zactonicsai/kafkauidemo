@@ -1,0 +1,73 @@
+services:
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: kafka
+    hostname: kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_NUM_PARTITIONS: "1"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - appnet
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.3
+    container_name: keycloak
+    restart: unless-stopped
+    command:
+      - start-dev
+      - --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: "${keycloak_admin_username}"
+      KC_BOOTSTRAP_ADMIN_PASSWORD: "${keycloak_admin_password}"
+      KC_HOSTNAME: "http://${public_ip}:8081"
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_ENABLED: "true"
+    ports:
+      - "8081:8080"
+    volumes:
+      - keycloak_data:/opt/keycloak/data/h2
+      - ./keycloak-realm.json:/opt/keycloak/data/import/kafka-ui-realm.json:ro
+    networks:
+      - appnet
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.5.0
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      - kafka
+      - keycloak
+    ports:
+      - "8080:8080"
+    environment:
+      "SPRING_CONFIG_ADDITIONAL-LOCATION": "/config.yml"
+    volumes:
+      - ./kafka-ui.yml:/config.yml:ro
+    networks:
+      - appnet
+
+networks:
+  appnet:
+    name: kafka-keycloak-appnet
+
+volumes:
+  kafka_data:
+  keycloak_data:
