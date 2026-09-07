@@ -1,0 +1,5 @@
+instance_type           = "t3.small"
+keycloak_admin_password = "change-me-admin"
+keycloak_client_secret  = "change-me-long-random-secret"
+alice_password          = "change-me-alice"
+bob_password            = "change-me-bob"

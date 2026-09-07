@@ -1,0 +1,12 @@
+variable "project" { type = string }
+variable "name" { type = string }
+variable "vpc_id" { type = string }
+variable "instance_id" { type = string }
+variable "port" { type = number }
+variable "health_check_path" { type = string }
+variable "hostname" { type = string }
+variable "priority" { type = number }
+variable "https_listener_arn" { type = string }
+variable "alb_dns_name" { type = string }
+variable "alb_zone_id" { type = string }
+variable "zone_id" { type = string }

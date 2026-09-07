@@ -1,61 +1,50 @@
 #!/usr/bin/env bash
-# Creates the whole stack.
-#   Phase 1: hosted zone only  -> you point your registrar's NS records at it
-#   Phase 2: everything else   -> ACM cert validates via DNS, ALB, EC2, records
-# Usage: ./scripts/create.sh            (interactive NS check)
-#        ./scripts/create.sh --skip-ns  (zone already delegated, just apply)
-set -euo pipefail
-cd "$(dirname "$0")/../terraform"
+# Usage: ./scripts/create.sh [network|keycloak|kafka|all]   (default: all)
+#   network  -> VPC, NAT, hosted zone (waits for NS delegation), certificate, ALB
+#   keycloak -> Keycloak EC2 + ALB rule + DNS record + SSM hand-off
+#   kafka    -> Kafka + Kafka UI EC2 + ALB rule + DNS record
+source "$(dirname "$0")/_lib.sh"
+need aws terraform jq dig
+WHAT=${1:-all}
 
-for bin in aws terraform jq dig; do
-  command -v "$bin" >/dev/null || { echo "Missing: $bin"; exit 1; }
-done
-[[ -f terraform.tfvars ]] || { echo "Copy terraform.tfvars.example to terraform.tfvars and edit it first."; exit 1; }
+aws sts get-caller-identity --query Account --output text >/dev/null || { echo "AWS CLI not configured"; exit 1; }
 
-echo "==> AWS identity"
-aws sts get-caller-identity --output table
+do_network() {
+  echo "=== STAGE 01-network"
+  if [[ "${SKIP_NS:-}" != "1" ]]; then
+    tf_apply 01-network -target=module.dns.aws_route53_zone.this
+    ZONE_ID=$(tf 01-network output -raw hosted_zone_id)
+    echo; echo "Set these NAME SERVERS for $DOMAIN at your registrar:"
+    aws route53 get-hosted-zone --id "$ZONE_ID" --query 'DelegationSet.NameServers' --output table
+    EXPECTED=$(aws route53 get-hosted-zone --id "$ZONE_ID" --query 'DelegationSet.NameServers[0]' --output text)
+    echo "Waiting for delegation (Ctrl+C to abort, re-run with SKIP_NS=1 later)..."
+    until dig +short NS "$DOMAIN" @8.8.8.8 | grep -qi "$EXPECTED"; do printf '.'; sleep 30; done
+    echo " delegated"
+  fi
+  tf_apply 01-network
+}
 
-DOMAIN=$(grep -E '^domain_name' terraform.tfvars | cut -d'"' -f2)
-REGION=$(grep -E '^region' terraform.tfvars | cut -d'"' -f2 || true); REGION=${REGION:-us-east-1}
+do_keycloak() {
+  echo "=== STAGE 02-keycloak"
+  tf_apply 02-keycloak
+  echo -n "Waiting for Keycloak to be healthy behind the ALB (3-6 min)"
+  wait_healthy "$(tf 02-keycloak output -raw target_group_arn)"
+  echo "Keycloak: $(tf 02-keycloak output -raw keycloak_url)"
+}
 
-terraform init -input=false
+do_kafka() {
+  echo "=== STAGE 03-kafka"
+  tf_apply 03-kafka
+  echo -n "Waiting for Kafka UI to be healthy behind the ALB (3-6 min)"
+  wait_healthy "$(tf 03-kafka output -raw target_group_arn)"
+  echo "Kafka UI: $(tf 03-kafka output -raw kafka_ui_url)"
+}
 
-# ---------------------------------------------------------------- Phase 1
-if [[ "${1:-}" != "--skip-ns" ]]; then
-  echo "==> Phase 1: creating Route 53 hosted zone for $DOMAIN"
-  terraform apply -input=false -auto-approve -target=aws_route53_zone.main
-  ZONE_ID=$(terraform output -raw hosted_zone_id)
-  echo
-  echo "Set these NAME SERVERS for $DOMAIN at your registrar:"
-  aws route53 get-hosted-zone --id "$ZONE_ID" --query 'DelegationSet.NameServers' --output table
-  echo
-  echo "Waiting for delegation (checking every 30s, Ctrl+C to abort)..."
-  EXPECTED=$(aws route53 get-hosted-zone --id "$ZONE_ID" --query 'DelegationSet.NameServers[0]' --output text)
-  until dig +short NS "$DOMAIN" @8.8.8.8 | grep -qi "$EXPECTED"; do
-    printf '.'; sleep 30
-  done
-  echo " delegated!"
-fi
-
-# ---------------------------------------------------------------- Phase 2
-echo "==> Phase 2: creating network, ALB, certificate, EC2 (5-10 min)"
-terraform apply -input=false -auto-approve
-
-INSTANCE_ID=$(terraform output -raw instance_id)
-TG_KC=$(terraform output -json target_group_arns | jq -r .keycloak)
-TG_UI=$(terraform output -json target_group_arns | jq -r .kafka_ui)
-
-echo "==> Waiting for the EC2 instance to boot and the containers to become healthy (5-8 min)..."
-aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID" --region "$REGION"
-for tg in "$TG_KC" "$TG_UI"; do
-  until [[ "$(aws elbv2 describe-target-health --target-group-arn "$tg" --region "$REGION" \
-              --query 'TargetHealthDescriptions[0].TargetHealth.State' --output text)" == "healthy" ]]; do
-    printf '.'; sleep 20
-  done
-done
-echo
-echo "================================================================"
-echo " Keycloak : $(terraform output -raw keycloak_url)   (admin / keycloak_admin_password)"
-echo " Kafka UI : $(terraform output -raw kafka_ui_url)   (alice / alice_password)"
-echo " Shell    : aws ssm start-session --target $INSTANCE_ID --region $REGION"
-echo "================================================================"
+case "$WHAT" in
+  network)  do_network ;;
+  keycloak) do_keycloak ;;
+  kafka)    do_kafka ;;
+  all)      do_network; do_keycloak; do_kafka ;;
+  *) echo "unknown stage: $WHAT"; exit 1 ;;
+esac
+echo "Done."

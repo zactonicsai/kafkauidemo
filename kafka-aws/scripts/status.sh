@@ -1,31 +1,23 @@
 #!/usr/bin/env bash
-# Shows what is running and whether the ALB targets are healthy.
-set -euo pipefail
-cd "$(dirname "$0")/../terraform"
-REGION=$(grep -E '^region' terraform.tfvars | cut -d'"' -f2 || true); REGION=${REGION:-us-east-1}
-
-INSTANCE_ID=$(terraform output -raw instance_id)
-echo "== EC2"
-aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
-  --query 'Reservations[0].Instances[0].{Id:InstanceId,Type:InstanceType,State:State.Name,PrivateIp:PrivateIpAddress}' --output table
-
-echo "== ALB targets"
-for name in keycloak kafka_ui; do
-  arn=$(terraform output -json target_group_arns | jq -r ".$name")
-  state=$(aws elbv2 describe-target-health --target-group-arn "$arn" --region "$REGION" \
-          --query 'TargetHealthDescriptions[0].TargetHealth.State' --output text)
-  printf '  %-10s %s\n' "$name" "$state"
+# Shows each stage's state, instance and ALB target health.
+source "$(dirname "$0")/_lib.sh"
+need aws terraform jq
+for s in "${STAGES[@]}"; do
+  dir=$(stage_dir "$s")
+  if [[ ! -f "$dir/terraform.tfstate" ]] || ! tf "$s" output >/dev/null 2>&1; then
+    echo "$s: not applied"; continue
+  fi
+  echo "== $s"
+  case "$s" in
+    01-network)
+      echo "  ALB: $(tf "$s" output -raw alb_dns_name)"
+      echo "  NS : $(tf "$s" output -json name_servers | jq -r 'join(", ")')" ;;
+    *)
+      id=$(tf "$s" output -raw instance_id)
+      st=$(aws ec2 describe-instances --instance-ids "$id" --region "$REGION" --query 'Reservations[0].Instances[0].State.Name' --output text)
+      th=$(aws elbv2 describe-target-health --target-group-arn "$(tf "$s" output -raw target_group_arn)" --region "$REGION" --query 'TargetHealthDescriptions[0].TargetHealth.State' --output text)
+      echo "  instance $id ($st)   target: $th"
+      echo "  url: $(tf "$s" output -json | jq -r 'to_entries[] | select(.key|endswith("_url")) | .value.value')"
+      echo "  shell: aws ssm start-session --target $id --region $REGION" ;;
+  esac
 done
-
-echo "== URLs"
-echo "  $(terraform output -raw keycloak_url)"
-echo "  $(terraform output -raw kafka_ui_url)"
-
-echo "== Containers (via SSM)"
-aws ssm send-command --region "$REGION" --instance-ids "$INSTANCE_ID" \
-  --document-name AWS-RunShellScript \
-  --parameters 'commands=["docker ps --format \"table {{.Names}}\t{{.Status}}\""]' \
-  --query 'Command.CommandId' --output text > /tmp/cmd_id
-sleep 4
-aws ssm get-command-invocation --region "$REGION" --instance-id "$INSTANCE_ID" \
-  --command-id "$(cat /tmp/cmd_id)" --query 'StandardOutputContent' --output text

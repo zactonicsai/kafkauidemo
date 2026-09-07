@@ -1,140 +1,133 @@
-# Kafka + Keycloak + Kafka UI on AWS — Terraform + AWS CLI
+# Kafka + Keycloak + Kafka UI on AWS — modular Terraform in 3 stages
 
-One private EC2 box runs the Docker stack from the earlier tutorial. The **only public entry point** is an Application Load Balancer with an HTTPS certificate; Route 53 gives you two friendly URLs.
-
-```
-                 Internet
-                     │
-       ┌─────────────▼──────────────┐
-       │  Route 53 hosted zone      │  keycloak.example.com ─┐
-       │  (example.com)             │  kafka.example.com    ─┤ A (alias)
-       └────────────────────────────┘                        │
-                                                             ▼
- ┌─────────────────────────── VPC 10.0.0.0/16 ───────────────────────────┐
- │  PUBLIC subnets (2 AZs)                                               │
- │   ┌───────────────┐   ┌──────────────────────────────┐                │
- │   │ Internet GW   │   │ ALB :443 (ACM cert) :80→443  │ ◄── the ONE   │
- │   └───────┬───────┘   │  host keycloak.* → :8080     │     public    │
- │           │           │  host kafka.*    → :8090     │     door      │
- │   ┌───────┴───────┐   └──────────────┬───────────────┘                │
- │   │ NAT Gateway   │                  │                                │
- │   └───────┬───────┘                  │ (security group: ALB only)     │
- │  PRIVATE subnets (2 AZs)             ▼                                │
- │           │  outbound only  ┌──────────────────────────────┐          │
- │           └────────────────►│ EC2 t3.medium (no public IP) │          │
- │                             │  docker compose:             │          │
- │                             │   kafka  keycloak  kafka-ui  │          │
- │                             │  managed via SSM (no SSH)    │          │
- │                             └──────────────────────────────┘          │
- └───────────────────────────────────────────────────────────────────────┘
-```
-
-## Files
+Same design as before (private VPC, one public ALB "gateway", Route 53 hosted zone, HTTPS), now split so that **Keycloak and Kafka each run on their own EC2** and each layer can be created, updated or destroyed on its own.
 
 ```
-kafka-aws/
-├── terraform/
-│   ├── versions.tf              provider + default tags
-│   ├── variables.tf             inputs (domain, passwords, size)
-│   ├── network.tf               VPC, subnets, IGW, NAT, route tables, security groups
-│   ├── dns.tf                   hosted zone, ACM certificate, A records
-│   ├── alb.tf                   load balancer, listeners, host rules, target groups
-│   ├── ec2.tf                   IAM role (SSM), private instance, cloud-init
-│   ├── user_data.sh.tftpl       installs Docker and writes the compose stack
-│   ├── outputs.tf
-│   └── terraform.tfvars.example
+ Internet ──► Route 53 (example.com) ──► ALB :443 (ACM cert)          [stage 01]
+                                          │ host keycloak.* ──► EC2 keycloak :8080   [stage 02]
+                                          │ host kafka.*    ──► EC2 kafka+kafka-ui :8090 [stage 03]
+              VPC: public subnets (ALB, NAT)  |  private subnets (both EC2, no public IPs, SSM only)
+```
+
+## Layout
+
+```
+kafka-aws-v2/
+├── common.tfvars.example        project / region / domain  -> shared by ALL stages
+├── modules/                     reusable building blocks
+│   ├── vpc/                     VPC, 2 public + 2 private subnets, IGW, NAT, routes
+│   ├── dns/                     hosted zone + DNS-validated ACM certificate
+│   ├── alb/                     public ALB, SG, HTTP→HTTPS, HTTPS listener
+│   ├── ec2-docker/              private EC2 + SSM role + SG (ALB-only) + Docker install
+│   ├── alb-service/             target group + host rule + Route 53 alias (per service)
+│   └── network-lookup/          data-only: finds stage-01 resources by tag/name
+├── stages/                      each is an independent Terraform root with its own state
+│   ├── 01-network/              vpc + dns + alb modules
+│   ├── 02-keycloak/             ec2-docker + alb-service + SSM hand-off parameters
+│   └── 03-kafka/                ec2-docker + alb-service, reads Keycloak info from SSM
 └── scripts/
-    ├── create.sh                two-phase create (zone → delegate NS → everything)
-    ├── destroy.sh               terraform destroy + AWS CLI leftover check
-    ├── status.sh                instance, target health, container list (via SSM)
-    └── cost.sh                  fixed estimate + real month-to-date spend (Cost Explorer)
+    ├── create.sh   [network|keycloak|kafka|all]
+    ├── destroy.sh  [kafka|keycloak|network|all]     (reverse order, leftover check)
+    ├── status.sh                                   per-stage health
+    └── cost.sh                                     estimate + real spend per stage
 ```
+
+## How the stages connect without shared state
+
+* **Stage 02/03 → stage 01:** `modules/network-lookup` finds the VPC (`tag:Name=<project>-vpc`), private subnets (`tag:Tier=private`), the ALB (`<project>-alb`), its 443 listener and the hosted zone by **name/tag** using data sources. No `terraform_remote_state`, so you can run any stage from any machine that has AWS credentials.
+* **Stage 03 → stage 02:** Keycloak writes two SSM parameters — `/<project>/keycloak/issuer-url` and `/<project>/keycloak/kafka-ui-client-secret` (SecureString). The Kafka stage reads them and injects them into Kafka UI's config. The secret is typed **once**, in `stages/02-keycloak/terraform.tfvars`.
+* **Kafka UI → Keycloak at runtime:** over the public URL `https://keycloak.<domain>` (out through NAT, in through the ALB), so a single `issuer-uri` works.
+
+Every resource is tagged `Project`, `ManagedBy`, and `Stage` (default tags in each provider), which is what `destroy.sh`'s leftover check and `cost.sh`'s per-stage breakdown key on.
 
 ## Step-by-step
 
-**Prerequisites:** `aws` CLI (configured, `aws sts get-caller-identity` works), `terraform` ≥ 1.6, `jq`, `dig`, and a domain you own.
+**Prerequisites:** `aws` (configured), `terraform` ≥ 1.6, `jq`, `dig`, a domain you own.
 
 1. **Configure**
    ```bash
-   cd terraform
-   cp terraform.tfvars.example terraform.tfvars
-   nano terraform.tfvars        # domain_name + 4 passwords (make them long)
+   cp common.tfvars.example common.tfvars                              # domain, region, project
+   cp stages/02-keycloak/terraform.tfvars.example stages/02-keycloak/terraform.tfvars   # passwords + client secret
+   cp stages/03-kafka/terraform.tfvars.example    stages/03-kafka/terraform.tfvars      # optional: instance size
+   # stages/01-network/terraform.tfvars is optional (only vpc_cidr)
    ```
-2. **Create** — the script creates the hosted zone first, prints 4 name servers, and waits until you set them at your registrar. Then it builds the rest (5–10 min) and waits for both ALB targets to be healthy (another 5–8 min while the box installs Docker and pulls images).
+2. **Stage 1 — network**
    ```bash
-   ../scripts/create.sh
+   ./scripts/create.sh network
    ```
-   If the domain is already delegated to this zone (e.g. second run): `../scripts/create.sh --skip-ns`.
-3. **Use**
-   * `https://kafka.<domain>` → click **Keycloak** → `alice` / `alice_password` (admin) or `bob` / `bob_password` (read-only)
-   * `https://keycloak.<domain>` → Administration Console → `admin` / `keycloak_admin_password`
-4. **Check on it**
+   Creates the hosted zone first, prints the 4 name servers, waits until you set them at your registrar, then builds VPC / NAT / certificate / ALB. (`SKIP_NS=1 ./scripts/create.sh network` skips the wait on later runs.)
+3. **Stage 2 — Keycloak**
    ```bash
-   ../scripts/status.sh
-   aws ssm start-session --target $(terraform output -raw instance_id)    # a shell on the box
+   ./scripts/create.sh keycloak
+   ```
+   Waits until `https://keycloak.<domain>` is healthy behind the ALB. Admin console: `admin` / `keycloak_admin_password`.
+4. **Stage 3 — Kafka + Kafka UI**
+   ```bash
+   ./scripts/create.sh kafka
+   ```
+   Waits until `https://kafka.<domain>` is healthy. Log in with `alice` (admin) or `bob` (read-only).
+
+   Or all three in order: `./scripts/create.sh all`.
+5. **Operate**
+   ```bash
+   ./scripts/status.sh
+   ./scripts/cost.sh
+   aws ssm start-session --target <instance-id>          # shell on either box; no SSH
    sudo docker compose -f /opt/kafka-stack/docker-compose.yml logs -f kafka-ui
    ```
-5. **See what it costs**
+6. **Destroy** — reverse order, any depth:
    ```bash
-   ../scripts/cost.sh
-   ```
-6. **Destroy** (everything, including data and the hosted zone)
-   ```bash
-   ../scripts/destroy.sh
+   ./scripts/destroy.sh kafka        # only the Kafka box; Keycloak + network stay
+   ./scripts/destroy.sh keycloak     # kafka + keycloak; network stays (note: NAT + ALB still bill ~$61/mo)
+   ./scripts/destroy.sh all          # everything; remove NS records at the registrar afterwards
    ```
 
-## Cost
+### Running Terraform by hand
 
-Approximate, **us-east-1, on-demand, running 24 × 7**. Prices drift; confirm with the [AWS Pricing Calculator](https://calculator.aws).
+Each stage is a normal root module:
 
-| Resource | Rate | Per month |
-|---|---|---|
-| EC2 `t3.medium` (2 vCPU, 4 GB) | $0.0416 / h | **$30.40** |
-| EBS gp3 root volume, 30 GB | $0.08 / GB | **$2.40** |
-| NAT Gateway | $0.045 / h + $0.045 / GB | **$32.85** + traffic |
-| Application Load Balancer | $0.0225 / h + LCU | **$16.40** + ~$1–6 |
-| Public IPv4 addresses ×3 (NAT EIP + 2 ALB IPs) | $0.005 / h each | **$10.95** |
-| Route 53 hosted zone | $0.50 / zone + $0.40 / M queries | **$0.50** |
-| ACM certificate | free | $0 |
-| SSM Session Manager | free | $0 |
-| Data transfer out | first 100 GB free, then $0.09 / GB | ~$0 for a dev box |
-| **Total** | | **≈ $95–100 / month (~$0.13 / hour)** |
+```bash
+cd stages/02-keycloak
+terraform init
+terraform plan  -var-file=../../common.tfvars -var-file=terraform.tfvars
+terraform apply -var-file=../../common.tfvars -var-file=terraform.tfvars
+```
 
-What surprises people: the **NAT gateway and load balancer cost more than the server**. Two ways to cut it:
+## Cost (us-east-1, on-demand, 24 × 7, approximate)
 
-| Option | Saves | Trade-off |
-|---|---|---|
-| Run `destroy.sh` when not in use, `create.sh --skip-ns` when needed | everything except $0.50 zone | ~15 min to rebuild; Kafka data is lost |
-| Replace the NAT gateway with a tiny NAT *instance* (e.g. `fck-nat` on t4g.nano, ~$3/mo) | ~$30 | one more thing to maintain, single point of failure |
-| Bigger instance `t3.large` (8 GB) | costs +$30 | needed if you add Schema Registry / Connect |
+| Stage | Resource | Rate | Per month |
+|---|---|---|---|
+| 01-network | NAT Gateway | $0.045 / h + $0.045 / GB | $32.85 |
+| 01-network | Application Load Balancer | $0.0225 / h + LCU | $16.40 + $1–6 |
+| 01-network | Public IPv4 × 3 (NAT + 2 ALB) | $0.005 / h each | $10.95 |
+| 01-network | Route 53 hosted zone | $0.50 + $0.40 / M queries | $0.50 |
+| 01-network | ACM cert, VPC, IGW, subnets | free | $0 |
+| | **Stage 01 subtotal** | | **≈ $61** |
+| 02-keycloak | EC2 `t3.small` (2 vCPU, 2 GB) | $0.0208 / h | $15.20 |
+| 02-keycloak | EBS gp3 20 GB | $0.08 / GB | $1.60 |
+| 02-keycloak | SSM Parameter Store (standard) | free | $0 |
+| | **Stage 02 subtotal** | | **≈ $17** |
+| 03-kafka | EC2 `t3.medium` (2 vCPU, 4 GB) | $0.0416 / h | $30.40 |
+| 03-kafka | EBS gp3 30 GB | $0.08 / GB | $2.40 |
+| | **Stage 03 subtotal** | | **≈ $33** |
+| all | SSM Session Manager, data out < 100 GB | free | $0 |
+| | **Total** | | **≈ $111–116 / month (~$0.16 / h)** |
 
-## Design notes (why it's built this way)
+Compared with the single-instance version (~$95–100) you pay ~$17 more for the second box and get isolation: you can rebuild Kafka without touching Keycloak's users, or resize either one independently. Note that the "empty" network stage still costs ~$61/month because of the NAT Gateway and ALB — destroy it too if the environment will sit idle for weeks (rebuilding takes ~10 min; the only thing you lose is the zone's name-server set, and the two-phase create handles that).
 
-* **All private except one point.** The EC2 has no public IP and its security group only accepts traffic from the ALB's security group. Admin access is SSM Session Manager through the NAT gateway, so port 22 is never opened.
-* **Two hostnames problem solved.** On AWS both the browser and the Kafka UI container reach Keycloak at `https://keycloak.<domain>` (the container goes out via NAT and back in through the ALB), so a single `issuer-uri` with OIDC discovery works and the config is shorter than the local version.
-* **Keycloak behind a TLS-terminating proxy** needs `KC_HOSTNAME=https://keycloak.<domain>`, `KC_PROXY_HEADERS=xforwarded` and `KC_HTTP_ENABLED=true`; without them logins loop or redirect to `http://`.
-* **Health checks:** ALB probes `/realms/kafka` (Keycloak) and `/actuator/health` (Kafka UI). `create.sh` waits on these so you know the stack is actually usable, not just "instance running".
-* **Reboot safe:** the stack is a systemd unit (`kafka-stack.service`); Docker volumes hold Kafka and Keycloak data.
-* **Certificate is created before the ALB listener**, using `aws_acm_certificate_validation`, so `terraform apply` won't fail with "certificate not issued".
+## Reuse ideas
 
-## Kept simple on purpose — upgrade paths
-
-| Simplification | Production alternative |
-|---|---|
-| 1 broker, replication factor 1 | 3 brokers across AZs, or Amazon MSK |
-| Keycloak `start-dev` with H2 file DB | `start` + RDS PostgreSQL (`KC_DB=postgres`) |
-| Passwords in `terraform.tfvars` | AWS Secrets Manager / SSM Parameter Store, read in cloud-init |
-| Terraform state on your laptop | S3 backend with state locking |
-| Single NAT gateway | one per AZ |
-| Single EC2 | Auto Scaling group + EFS/EBS snapshots |
+* **Another service behind the same gateway** (Schema Registry, Grafana…): new stage with `ec2-docker` + `alb-service`, pick a free `priority` and hostname, and add the hostname to `certificate_hosts` in stage 01.
+* **Another environment** (`dev` / `prod`): a second `common.tfvars` with a different `project` and domain; every resource name and tag is derived from `project`, so they don't collide in one account.
+* **Team state:** replace `backend "local" {}` in each stage's `providers.tf` with an S3 backend using a different `key` per stage (`network.tfstate`, `keycloak.tfstate`, `kafka.tfstate`).
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `create.sh` stuck on "Waiting for delegation" | NS change at the registrar can take up to 48 h (usually minutes). Verify with `dig NS yourdomain.com @8.8.8.8` |
-| ACM validation times out | Same cause — zone not delegated yet |
-| Targets never healthy | `aws ssm start-session`, then `sudo tail -f /var/log/cloud-init-output.log` |
-| Keycloak login redirects to `http://` | Check the three `KC_*` proxy variables in `/opt/kafka-stack/docker-compose.yml` |
-| Kafka UI restarts in a loop at start | Normal for a minute: it needs Keycloak's discovery document; `restart: unless-stopped` retries |
-| `cost.sh` shows no data | Activate the `Project` cost-allocation tag in Billing → Cost allocation tags; wait 24 h |
+| Stage 02/03 fails with "no matching VPC / LB found" | Stage 01 isn't applied, or `project` differs between `common.tfvars` runs |
+| Stage 03 fails on `data.aws_ssm_parameter` | Stage 02 isn't applied yet (it writes the parameters) |
+| Kafka UI target never healthy | Keycloak must be healthy first (UI fetches the OIDC discovery document at start). Check `sudo tail -f /var/log/cloud-init-output.log` via SSM |
+| Keycloak login redirects to `http://` | `KC_HOSTNAME` / `KC_PROXY_HEADERS` in `/opt/keycloak-stack/docker-compose.yml` |
+| ACM validation hangs | Domain not delegated yet: `dig NS <domain> @8.8.8.8` |
+| Changed a password in stage 02 tfvars | `user_data_replace_on_change` recreates the Keycloak instance (H2 data is lost — export the realm first if you added users by hand) |
