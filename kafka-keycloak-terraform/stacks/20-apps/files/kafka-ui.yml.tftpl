@@ -1,0 +1,30 @@
+kafka:
+  clusters:
+    - name: local-kafka
+      bootstrapServers: kafka:9092
+
+auth:
+  type: OAUTH2
+  oauth2:
+    client:
+      keycloak:
+        clientId: kafka-ui
+        clientSecret: "${kafka_ui_secret}"
+        scope: openid
+        client-name: Keycloak
+        provider: keycloak
+        redirect-uri: "http://${kafka_public_ip}:8080/login/oauth2/code/keycloak"
+        authorization-grant-type: authorization_code
+
+        # Browser/front-channel login always uses Keycloak HTTPS on the stable EIP.
+        authorization-uri: "https://${keycloak_public_ip}:8443/realms/kafka-ui/protocol/openid-connect/auth"
+
+        # Server/back-channel calls stay inside the VPC, but are HTTPS too.
+        # The Keycloak self-signed certificate contains the private IP as a SAN.
+        token-uri: "https://${keycloak_private_ip}:8443/realms/kafka-ui/protocol/openid-connect/token"
+        jwk-set-uri: "https://${keycloak_private_ip}:8443/realms/kafka-ui/protocol/openid-connect/certs"
+        user-info-uri: "https://${keycloak_private_ip}:8443/realms/kafka-ui/protocol/openid-connect/userinfo"
+
+        user-name-attribute: preferred_username
+        custom-params:
+          type: oauth

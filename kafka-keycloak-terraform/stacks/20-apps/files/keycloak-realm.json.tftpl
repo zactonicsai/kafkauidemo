@@ -1,0 +1,49 @@
+{
+  "realm": "kafka-ui",
+  "displayName": "Kafka UI",
+  "enabled": true,
+  "registrationAllowed": false,
+  "resetPasswordAllowed": true,
+  "loginWithEmailAllowed": true,
+  "clients": [
+    {
+      "clientId": "kafka-ui",
+      "name": "Kafka UI",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "${kafka_ui_secret}",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "rootUrl": "http://${kafka_public_ip}:8080",
+      "baseUrl": "http://${kafka_public_ip}:8080",
+      "redirectUris": [
+        "http://${kafka_public_ip}:8080/login/oauth2/code/keycloak"
+      ],
+      "webOrigins": [
+        "http://${kafka_public_ip}:8080"
+      ],
+      "attributes": {
+        "post.logout.redirect.uris": "http://${kafka_public_ip}:8080/*"
+      }
+    }
+  ],
+  "users": [
+    {
+      "username": "${kafka_ui_username}",
+      "firstName": "Kafka",
+      "lastName": "User",
+      "email": "kafkauser@example.invalid",
+      "emailVerified": true,
+      "enabled": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${kafka_ui_password}",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

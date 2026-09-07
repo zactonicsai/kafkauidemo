@@ -1,0 +1,41 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.3
+    container_name: keycloak
+    restart: unless-stopped
+    mem_limit: 1400m
+    command:
+      - start-dev
+      - --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: "${keycloak_admin_username}"
+      KC_BOOTSTRAP_ADMIN_PASSWORD: "${keycloak_admin_password}"
+
+      # Public issuer/redirect base. All Keycloak browser and OIDC URLs use HTTPS 8443.
+      KC_HOSTNAME: "https://${keycloak_public_ip}:8443"
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+
+      # Disable plaintext HTTP and enable Keycloak's HTTPS listener on 8443.
+      KC_HTTP_ENABLED: "false"
+      KC_HTTPS_PORT: "8443"
+      KC_HTTPS_CERTIFICATE_FILE: "/opt/keycloak/conf/tls/keycloak.crt"
+      KC_HTTPS_CERTIFICATE_KEY_FILE: "/opt/keycloak/conf/tls/keycloak.key"
+      KC_HTTPS_PROTOCOLS: "TLSv1.3,TLSv1.2"
+
+      # Health and metrics remain on the management port, but inherit HTTPS/TLS.
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_HTTP_MANAGEMENT_SCHEME: "inherited"
+      KC_HTTP_MANAGEMENT_HOST: "0.0.0.0"
+      KC_HTTP_MANAGEMENT_PORT: "9000"
+
+      JAVA_OPTS_KC_HEAP: "-XX:InitialRAMPercentage=20 -XX:MaxRAMPercentage=60"
+    ports:
+      - "0.0.0.0:8443:8443"
+      - "0.0.0.0:9000:9000"
+    volumes:
+      # Bind the H2 data directory to a host path owned by Keycloak UID 1000.
+      - ./keycloak-data/h2:/opt/keycloak/data/h2
+      - ./keycloak-realm.json:/opt/keycloak/data/import/kafka-ui-realm.json:ro
+      - ./tls/keycloak.crt:/opt/keycloak/conf/tls/keycloak.crt:ro
+      - ./tls/keycloak.key:/opt/keycloak/conf/tls/keycloak.key:ro

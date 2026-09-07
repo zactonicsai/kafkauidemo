@@ -1,0 +1,156 @@
+#!/bin/bash
+set -euxo pipefail
+
+exec > >(tee -a /var/log/keycloak-bootstrap.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+STACK_DIR="/opt/keycloak-stack"
+KEYCLOAK_DATA_DIR="$STACK_DIR/keycloak-data"
+TLS_DIR="$STACK_DIR/tls"
+COMPOSE_VERSION="v5.1.4"
+
+mkdir -p "$STACK_DIR" "$KEYCLOAK_DATA_DIR/h2" "$TLS_DIR"
+
+# The official Keycloak container runs as UID 1000 and GID 0.
+chown -R 1000:0 "$KEYCLOAK_DATA_DIR"
+chmod -R u+rwX,g+rwX "$KEYCLOAK_DATA_DIR"
+
+# Amazon Linux 2023 normally already has curl-minimal. Do not install full curl.
+# openssl is used to create the lab TLS certificate.
+dnf install -y docker openssl
+if ! command -v curl >/dev/null 2>&1; then
+  dnf install -y curl-minimal
+fi
+
+systemctl enable --now docker
+systemctl enable --now amazon-ssm-agent || true
+usermod -aG docker ec2-user
+
+for i in {1..30}; do
+  docker info >/dev/null 2>&1 && break
+  sleep 2
+done
+docker info >/dev/null
+
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -fsSL \
+  "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-x86_64" \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+docker compose version
+
+###############################################################################
+# LAB TLS CERTIFICATE
+#
+# There is no domain name in this lab, so create a self-signed certificate.
+# Include all addresses used to reach Keycloak:
+#   - stable public Elastic IP
+#   - EC2 private VPC IP used by Kafka UI
+#   - 127.0.0.1 for local health checks
+###############################################################################
+
+IMDS_TOKEN="$(curl -fsS -X PUT \
+  -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' \
+  http://169.254.169.254/latest/api/token)"
+PRIVATE_IP="$(curl -fsS \
+  -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  http://169.254.169.254/latest/meta-data/local-ipv4)"
+PUBLIC_IP="${keycloak_public_ip}"
+
+cat > "$TLS_DIR/openssl.cnf" <<TLSCONF
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+distinguished_name = dn
+x509_extensions = v3_req
+
+[dn]
+CN = $PUBLIC_IP
+O = Kafka Keycloak Lab
+
+[v3_req]
+subjectAltName = @alt_names
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+basicConstraints = critical, CA:false
+
+[alt_names]
+IP.1 = $PUBLIC_IP
+IP.2 = $PRIVATE_IP
+IP.3 = 127.0.0.1
+DNS.1 = localhost
+TLSCONF
+
+openssl req \
+  -x509 \
+  -nodes \
+  -newkey rsa:2048 \
+  -sha256 \
+  -days 3650 \
+  -keyout "$TLS_DIR/keycloak.key" \
+  -out "$TLS_DIR/keycloak.crt" \
+  -config "$TLS_DIR/openssl.cnf"
+
+# Keycloak UID 1000 must be able to read the key and certificate.
+chown 1000:0 "$TLS_DIR/keycloak.crt" "$TLS_DIR/keycloak.key"
+chmod 644 "$TLS_DIR/keycloak.crt"
+chmod 640 "$TLS_DIR/keycloak.key"
+
+# Show SANs in the bootstrap log for troubleshooting.
+openssl x509 -in "$TLS_DIR/keycloak.crt" -noout -subject -issuer -dates -ext subjectAltName
+
+echo '${keycloak_compose_b64}' | base64 -d > "$STACK_DIR/docker-compose.yml"
+echo '${keycloak_realm_b64}' | base64 -d > "$STACK_DIR/keycloak-realm.json"
+chmod 644 "$STACK_DIR/docker-compose.yml"
+
+# Keycloak runs as UID 1000, so it must be able to read the realm import file.
+chown 1000:0 "$STACK_DIR/keycloak-realm.json"
+chmod 640 "$STACK_DIR/keycloak-realm.json"
+python3 -m json.tool "$STACK_DIR/keycloak-realm.json" >/dev/null
+
+cd "$STACK_DIR"
+docker compose config
+docker compose pull
+
+cat > /etc/systemd/system/keycloak-compose.service <<SERVICE
+[Unit]
+Description=Keycloak Docker Compose Stack
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$STACK_DIR
+ExecStartPre=/usr/bin/chown -R 1000:0 $KEYCLOAK_DATA_DIR
+ExecStartPre=/usr/bin/chmod -R u+rwX,g+rwX $KEYCLOAK_DATA_DIR
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+RemainAfterExit=yes
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable --now keycloak-compose.service
+
+# Keycloak can take a little while on first boot. Verify using the generated cert.
+for i in {1..60}; do
+  if curl --cacert "$TLS_DIR/keycloak.crt" -fsS \
+    "https://127.0.0.1:8443/realms/kafka-ui/.well-known/openid-configuration" \
+    >/dev/null 2>&1; then
+    echo "Keycloak HTTPS realm is ready."
+    break
+  fi
+  sleep 2
+done
+
+curl --cacert "$TLS_DIR/keycloak.crt" -fsS "https://127.0.0.1:9000/health/ready" || true
+curl --cacert "$TLS_DIR/keycloak.crt" -fsS "https://127.0.0.1:9000/metrics" | head -20 || true
+
+docker compose ps
+docker compose logs --tail=100 || true
+
+echo "Keycloak HTTPS host bootstrap complete."
