@@ -322,7 +322,7 @@ resource "aws_launch_template" "stack" {
 
 resource "aws_instance" "stack" {
   subnet_id                   = aws_subnet.public.id
-  associate_public_ip_address = true
+ # associate_public_ip_address = true
 
   launch_template {
     id      = aws_launch_template.stack.id
