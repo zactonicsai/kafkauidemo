@@ -1,0 +1,91 @@
+# Same as config.yml, plus RBAC (Role-Based Access Control).
+# Keycloak realm role "kafka-admin"  -> Kafka UI role "admins"  (can do everything)
+# Keycloak realm role "kafka-viewer" -> Kafka UI role "viewers" (look, don't touch)
+#
+# To use it, change the volume line in docker-compose.yml to:
+#   - ./kafka-ui/config-rbac.yml:/config.yml:ro
+# then run:  docker compose up -d --force-recreate kafka-ui
+
+kafka:
+  clusters:
+    - name: local
+      bootstrapServers: kafka:9092
+
+auth:
+  type: OAUTH2
+  oauth2:
+    client:
+      keycloak:
+        clientId: kafka-ui
+        clientSecret: ${KEYCLOAK_CLIENT_SECRET:kafka-ui-secret}
+        scope: openid
+        client-name: Keycloak
+        provider: keycloak
+        authorization-grant-type: authorization_code
+        redirect-uri: http://localhost:8090/login/oauth2/code/keycloak
+        authorization-uri: http://localhost:8080/realms/kafka/protocol/openid-connect/auth
+        token-uri: http://keycloak:8080/realms/kafka/protocol/openid-connect/token
+        user-info-uri: http://keycloak:8080/realms/kafka/protocol/openid-connect/userinfo
+        jwk-set-uri: http://keycloak:8080/realms/kafka/protocol/openid-connect/certs
+        user-name-attribute: preferred_username
+        custom-params:
+          type: oauth
+          roles-field: roles
+
+rbac:
+  roles:
+    - name: admins
+      clusters:
+        - local
+      subjects:
+        - provider: oauth
+          type: role
+          value: kafka-admin
+      permissions:
+        - resource: applicationconfig
+          actions: all
+        - resource: clusterconfig
+          actions: all
+        - resource: topic
+          value: ".*"
+          actions: all
+        - resource: consumer
+          value: ".*"
+          actions: all
+        - resource: schema
+          value: ".*"
+          actions: all
+        - resource: connect
+          value: ".*"
+          actions: all
+        - resource: ksql
+          actions: all
+        - resource: acl
+          actions: all
+        - resource: audit
+          actions: all
+
+    - name: viewers
+      clusters:
+        - local
+      subjects:
+        - provider: oauth
+          type: role
+          value: kafka-viewer
+      permissions:
+        - resource: clusterconfig
+          actions: [ view ]
+        - resource: topic
+          value: ".*"
+          actions: [ view, messages_read ]
+        - resource: consumer
+          value: ".*"
+          actions: [ view ]
+        - resource: schema
+          value: ".*"
+          actions: [ view ]
+        - resource: connect
+          value: ".*"
+          actions: [ view ]
+        - resource: acl
+          actions: [ view ]

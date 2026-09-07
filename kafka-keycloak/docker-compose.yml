@@ -1,0 +1,92 @@
+# Kafka (KRaft, no ZooKeeper) + Keycloak (identity provider) + Kafbat Kafka UI (login via Keycloak)
+#
+# Ports on YOUR machine:
+#   http://localhost:8080  -> Keycloak admin console  (admin / admin)
+#   http://localhost:8090  -> Kafka UI                (alice / alice  or  bob / bob)
+#   localhost:29092        -> Kafka bootstrap server for apps running on your laptop
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # 1) KAFKA - a single broker running in KRaft mode (Kafka 4.x has no ZooKeeper)
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: kafka
+    ports:
+      - "29092:29092"          # for clients on your laptop
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Three "doors" into the broker:
+      #   PLAINTEXT      -> other containers (kafka:9092)
+      #   PLAINTEXT_HOST -> your laptop      (localhost:29092)
+      #   CONTROLLER     -> KRaft internal   (kafka:9093)
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single-broker settings (replication factor must be 1 when there is only 1 broker)
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # 2) KEYCLOAK - the identity provider (handles usernames, passwords, roles)
+  #    On first start it imports keycloak/realm-kafka.json, which creates:
+  #      * realm  "kafka"
+  #      * client "kafka-ui" (secret: kafka-ui-secret)
+  #      * roles  kafka-admin, kafka-viewer
+  #      * users  alice (kafka-admin) and bob (kafka-viewer)
+  # ---------------------------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7
+    container_name: keycloak
+    command: ["start-dev", "--import-realm"]
+    ports:
+      - "8080:8080"
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import:ro
+      - keycloak-data:/opt/keycloak/data/h2
+
+  # ---------------------------------------------------------------------------
+  # 3) KAFKA UI (Kafbat) - the web dashboard; login is delegated to Keycloak
+  #    All settings live in kafka-ui/config.yml
+  # ---------------------------------------------------------------------------
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.5.0
+    container_name: kafka-ui
+    ports:
+      - "8090:8080"            # Keycloak already uses 8080 on your laptop, so UI is on 8090
+    environment:
+      SPRING_CONFIG_ADDITIONAL-LOCATION: /config.yml
+      KEYCLOAK_CLIENT_SECRET: kafka-ui-secret
+    volumes:
+      - ./kafka-ui/config.yml:/config.yml:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+
+volumes:
+  kafka-data:
+  keycloak-data:

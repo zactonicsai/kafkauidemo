@@ -1,0 +1,40 @@
+# Kafbat Kafka UI configuration
+# Login is handled by Keycloak (OpenID Connect / OAuth2 "authorization code" flow).
+#
+# WHY TWO DIFFERENT HOSTNAMES?
+#   * "localhost:8080"  = URLs your BROWSER visits (the login page). Your browser
+#                         does not know the Docker name "keycloak", only "localhost".
+#   * "keycloak:8080"   = URLs the KAFKA-UI CONTAINER calls behind the scenes
+#                         (token exchange, user info, signing keys). Inside Docker
+#                         the container reaches Keycloak by its service name.
+
+kafka:
+  clusters:
+    - name: local
+      bootstrapServers: kafka:9092
+
+auth:
+  type: OAUTH2
+  oauth2:
+    client:
+      keycloak:
+        clientId: kafka-ui
+        clientSecret: ${KEYCLOAK_CLIENT_SECRET:kafka-ui-secret}
+        scope: openid
+        client-name: Keycloak                     # text on the login button
+        provider: keycloak
+        authorization-grant-type: authorization_code
+        redirect-uri: http://localhost:8090/login/oauth2/code/keycloak
+        # browser-facing
+        authorization-uri: http://localhost:8080/realms/kafka/protocol/openid-connect/auth
+        # container-to-container (back channel)
+        token-uri: http://keycloak:8080/realms/kafka/protocol/openid-connect/token
+        user-info-uri: http://keycloak:8080/realms/kafka/protocol/openid-connect/userinfo
+        jwk-set-uri: http://keycloak:8080/realms/kafka/protocol/openid-connect/certs
+        user-name-attribute: preferred_username
+        custom-params:
+          type: oauth
+          roles-field: roles                       # flat "roles" claim added by the Keycloak mapper
+
+# No "rbac:" block here = every user who can log in to Keycloak gets full access.
+# See config-rbac.yml for role-based permissions (alice = admin, bob = read-only).
