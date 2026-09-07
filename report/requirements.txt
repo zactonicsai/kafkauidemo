@@ -1,0 +1,13 @@
+# requirements.txt for terraform_report.py
+#
+# The script uses ONLY the Python standard library (argparse, json, sys,
+# datetime, pathlib, typing), so no third-party packages are required.
+#
+# Minimum Python version: 3.8
+#
+# Install (creates an empty environment that just needs Python):
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# Optional extras for nicer terminal previews of the Markdown (uncomment if wanted):
+# rich>=13.0

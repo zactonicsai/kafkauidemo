@@ -1,0 +1,193 @@
+# 🏗️ Terraform Deployment Report
+
+> **Generated:** 2026-09-07 18:38 UTC  
+> **Source:** `/tmp/sample_state.json`  
+> **Default region:** `us-east-1`  
+> **Managed AWS resources:** **5**
+
+## 📊 Summary by Resource Type
+
+| Resource Type | Label | Count |
+|---|---|---:|
+| `aws_instance` | EC2 Instance | 1 |
+| `aws_internet_gateway` | Internet Gateway | 1 |
+| `aws_s3_bucket` | S3 Bucket | 1 |
+| `aws_subnet` | Subnet | 1 |
+| `aws_vpc` | VPC | 1 |
+
+## 📋 Resource Inventory
+
+| # | Name | Type | AWS ID | Terraform Address |
+|---:|---|---|---|---|
+| 1 | demo-vpc | `aws_vpc` | `vpc-0abc123` | `aws_vpc.main` |
+| 2 | pub | `aws_subnet` | `subnet-0def456` | `aws_subnet.pub` |
+| 3 | gw | `aws_internet_gateway` | `igw-0aaa111` | `aws_internet_gateway.gw` |
+| 4 | web-1 | `aws_instance` | `i-0123456789` | `aws_instance.web` |
+| 5 | logs | `aws_s3_bucket` | `my-logs-bucket` | `module.storage.aws_s3_bucket.logs` |
+
+## 🔍 Resource Details
+
+### 1. VPC — `demo-vpc`
+
+- **Terraform address:** `aws_vpc.main`
+- **Type:** `aws_vpc`
+- **AWS ID:** `vpc-0abc123`
+
+| Attribute | Value |
+|---|---|
+| `id` | `vpc-0abc123` |
+| `cidr_block` | `10.0.0.0/16` |
+
+**👀 View with AWS CLI**
+
+```bash
+aws ec2 describe-vpcs --vpc-ids vpc-0abc123 --region us-east-1
+```
+
+**💣 Destroy with AWS CLI**
+
+```bash
+aws ec2 delete-vpc --vpc-id vpc-0abc123 --region us-east-1
+```
+
+### 2. Subnet — `pub`
+
+- **Terraform address:** `aws_subnet.pub`
+- **Type:** `aws_subnet`
+- **AWS ID:** `subnet-0def456`
+
+| Attribute | Value |
+|---|---|
+| `id` | `subnet-0def456` |
+| `cidr_block` | `10.0.1.0/24` |
+| `availability_zone` | `us-east-1a` |
+| `vpc_id` | `vpc-0abc123` |
+
+**👀 View with AWS CLI**
+
+```bash
+aws ec2 describe-subnets --subnet-ids subnet-0def456 --region us-east-1
+```
+
+**💣 Destroy with AWS CLI**
+
+```bash
+aws ec2 delete-subnet --subnet-id subnet-0def456 --region us-east-1
+```
+
+### 3. Internet Gateway — `gw`
+
+- **Terraform address:** `aws_internet_gateway.gw`
+- **Type:** `aws_internet_gateway`
+- **AWS ID:** `igw-0aaa111`
+
+| Attribute | Value |
+|---|---|
+| `id` | `igw-0aaa111` |
+| `vpc_id` | `vpc-0abc123` |
+
+**👀 View with AWS CLI**
+
+```bash
+aws ec2 describe-internet-gateways --internet-gateway-ids igw-0aaa111 --region us-east-1
+```
+
+**💣 Destroy with AWS CLI**
+
+```bash
+aws ec2 detach-internet-gateway --internet-gateway-id igw-0aaa111 --vpc-id vpc-0abc123 --region us-east-1
+aws ec2 delete-internet-gateway --internet-gateway-id igw-0aaa111 --region us-east-1
+```
+
+### 4. EC2 Instance — `web-1`
+
+- **Terraform address:** `aws_instance.web`
+- **Type:** `aws_instance`
+- **AWS ID:** `i-0123456789`
+
+| Attribute | Value |
+|---|---|
+| `id` | `i-0123456789` |
+| `instance_type` | `t3.micro` |
+| `ami` | `ami-0abcdef` |
+| `public_ip` | `3.4.5.6` |
+
+**👀 View with AWS CLI**
+
+```bash
+aws ec2 describe-instances --instance-ids i-0123456789 --region us-east-1
+```
+
+**💣 Destroy with AWS CLI**
+
+```bash
+aws ec2 terminate-instances --instance-ids i-0123456789 --region us-east-1
+```
+
+### 5. S3 Bucket — `logs`
+
+- **Terraform address:** `module.storage.aws_s3_bucket.logs`
+- **Type:** `aws_s3_bucket`
+- **AWS ID:** `my-logs-bucket`
+
+| Attribute | Value |
+|---|---|
+| `id` | `my-logs-bucket` |
+| `bucket` | `my-logs-bucket` |
+
+**👀 View with AWS CLI**
+
+```bash
+aws s3api get-bucket-location --bucket my-logs-bucket
+aws s3 ls s3://my-logs-bucket
+```
+
+**💣 Destroy with AWS CLI**
+
+```bash
+aws s3 rb s3://my-logs-bucket --force
+```
+
+## 📤 Terraform Outputs
+
+| Output | Value | Sensitive |
+|---|---|---|
+| `vpc_id` | `"vpc-0abc123"` | — |
+| `db_pass` | `***` | ✅ |
+
+## 🧾 All VIEW Commands (copy/paste)
+
+```bash
+# aws_vpc.main
+aws ec2 describe-vpcs --vpc-ids vpc-0abc123 --region us-east-1
+# aws_subnet.pub
+aws ec2 describe-subnets --subnet-ids subnet-0def456 --region us-east-1
+# aws_internet_gateway.gw
+aws ec2 describe-internet-gateways --internet-gateway-ids igw-0aaa111 --region us-east-1
+# aws_instance.web
+aws ec2 describe-instances --instance-ids i-0123456789 --region us-east-1
+# module.storage.aws_s3_bucket.logs
+aws s3api get-bucket-location --bucket my-logs-bucket
+aws s3 ls s3://my-logs-bucket
+```
+
+## 🔥 All DESTROY Commands (reverse dependency order)
+
+> ⚠️ **Warning:** these commands are irreversible. Prefer `terraform destroy` where possible; use these only if the Terraform state is lost or corrupted.
+
+```bash
+# module.storage.aws_s3_bucket.logs
+aws s3 rb s3://my-logs-bucket --force
+# aws_instance.web
+aws ec2 terminate-instances --instance-ids i-0123456789 --region us-east-1
+# aws_internet_gateway.gw
+aws ec2 detach-internet-gateway --internet-gateway-id igw-0aaa111 --vpc-id vpc-0abc123 --region us-east-1
+aws ec2 delete-internet-gateway --internet-gateway-id igw-0aaa111 --region us-east-1
+# aws_subnet.pub
+aws ec2 delete-subnet --subnet-id subnet-0def456 --region us-east-1
+# aws_vpc.main
+aws ec2 delete-vpc --vpc-id vpc-0abc123 --region us-east-1
+```
+
+---
+*Report generated by `terraform_report.py`.*
