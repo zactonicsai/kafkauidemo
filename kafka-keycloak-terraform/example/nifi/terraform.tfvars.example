@@ -1,0 +1,36 @@
+region    = "us-east-1"
+name      = "nifi-dev"
+subnet_id = "subnet-0123456789abcdef0"
+
+instance_type       = "m6i.large"
+allowed_cidr_blocks = ["10.0.0.0/8"]
+tags = {
+  Environment = "dev"
+  Owner       = "data-platform"
+}
+
+nifi_version             = "2.4.0"
+nifi_proxy_host          = "nifi.dev.example.com:8443"
+nifi_sensitive_props_key = "change-me-to-a-long-random-value"
+
+nifi_single_user_username = "admin"
+nifi_single_user_password = "ChangeMePlease123!"
+
+# Any nifi.properties key can be overridden or added here
+nifi_properties = {
+  "nifi.web.https.port"                        = "8443"
+  "nifi.cluster.is.node"                       = "false"
+  "nifi.queue.backpressure.count"              = "20000"
+  "nifi.queue.backpressure.size"               = "2 GB"
+  "nifi.provenance.repository.max.storage.size" = "20 GB"
+  "nifi.bored.yield.duration"                  = "10 millis"
+  "nifi.flow.configuration.archive.max.count"  = "10"
+}
+
+# Custom user properties exposed to processors via expression language
+nifi_user_properties = {
+  env              = "dev"
+  s3_landing_bucket = "acme-nifi-landing-dev"
+  kafka_bootstrap  = "b-1.kafka.dev.internal:9092"
+  batch_size       = "500"
+}

@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+###############################################################################
+# NiFi bootstrap (rendered by Terraform templatefile())
+#
+#  1. Install Java + NiFi ${nifi_version} under ${nifi_home}
+#  2. Apply nifi.properties overrides (upsert – existing keys are replaced,
+#     new keys are appended)
+#  3. Write user/custom properties to conf/${user_properties_file} and point
+#     nifi.variable.registry.properties at it
+#  4. Set single-user credentials and start NiFi as a systemd unit
+###############################################################################
+set -euo pipefail
+exec > >(tee -a /var/log/nifi-bootstrap.log) 2>&1
+
+NIFI_VERSION="${nifi_version}"
+NIFI_HOME="${nifi_home}"
+NIFI_USER="${nifi_user}"
+NIFI_DIST="nifi-$${NIFI_VERSION}-bin.zip"
+NIFI_URL="${nifi_download_url}"
+
+# --- 1. Java + NiFi -----------------------------------------------------------
+dnf install -y java-${java_version}-amazon-corretto-headless unzip curl
+
+id -u "$${NIFI_USER}" >/dev/null 2>&1 || useradd --system --home "$${NIFI_HOME}" --shell /sbin/nologin "$${NIFI_USER}"
+
+if [ ! -d "$${NIFI_HOME}" ]; then
+  mkdir -p /opt
+  cd /tmp
+  curl -fsSL -o "$${NIFI_DIST}" "$${NIFI_URL}"
+  unzip -q "$${NIFI_DIST}" -d /opt
+  ln -sfn "/opt/nifi-$${NIFI_VERSION}" "$${NIFI_HOME}"
+  rm -f "$${NIFI_DIST}"
+fi
+
+CONF="$${NIFI_HOME}/conf"
+PROPS="$${CONF}/nifi.properties"
+
+%{ if data_device != "" ~}
+# --- Optional data volume for repositories -----------------------------------
+DATA_MOUNT="${data_mount}"
+if ! blkid "${data_device}" >/dev/null 2>&1; then
+  mkfs.xfs -f "${data_device}"
+fi
+mkdir -p "$${DATA_MOUNT}"
+grep -q "$${DATA_MOUNT}" /etc/fstab || echo "${data_device} $${DATA_MOUNT} xfs defaults,nofail 0 2" >> /etc/fstab
+mount -a
+mkdir -p "$${DATA_MOUNT}"/{flowfile_repository,content_repository,provenance_repository,database_repository}
+%{ endif ~}
+
+# --- 2. nifi.properties overrides --------------------------------------------
+# set_prop KEY VALUE : replace the line if KEY exists, otherwise append it.
+set_prop() {
+  local key="$1" val="$2"
+  local esc_key esc_val
+  esc_key=$(printf '%s' "$${key}" | sed 's/[][\.*^$/]/\\&/g')
+  esc_val=$(printf '%s' "$${val}" | sed 's/[\/&]/\\&/g')
+  if grep -qE "^$${esc_key}=" "$${PROPS}"; then
+    sed -i "s/^$${esc_key}=.*/$${esc_key}=$${esc_val}/" "$${PROPS}"
+  else
+    printf '%s=%s\n' "$${key}" "$${val}" >> "$${PROPS}"
+  fi
+}
+
+%{ for k, v in nifi_properties ~}
+set_prop '${k}' '${v}'
+%{ endfor ~}
+set_prop 'nifi.sensitive.props.key' '${sensitive_props_key}'
+
+# --- 3. user / custom properties ---------------------------------------------
+USER_PROPS="$${CONF}/${user_properties_file}"
+cat > "$${USER_PROPS}" <<'EOF'
+# Managed by Terraform – custom NiFi properties
+%{ for k, v in user_properties ~}
+${k}=${v}
+%{ endfor ~}
+EOF
+set_prop 'nifi.variable.registry.properties' "./conf/${user_properties_file}"
+
+# --- 4. credentials, ownership, service --------------------------------------
+%{ if single_user_username != "" ~}
+"$${NIFI_HOME}/bin/nifi.sh" set-single-user-credentials '${single_user_username}' '${single_user_password}'
+%{ endif ~}
+
+chown -R "$${NIFI_USER}:$${NIFI_USER}" "/opt/nifi-$${NIFI_VERSION}" "$${NIFI_HOME}"
+%{ if data_device != "" ~}
+chown -R "$${NIFI_USER}:$${NIFI_USER}" "$${DATA_MOUNT}"
+%{ endif ~}
+
+cat > /etc/systemd/system/nifi.service <<EOF
+[Unit]
+Description=Apache NiFi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=$${NIFI_USER}
+Group=$${NIFI_USER}
+Environment=JAVA_HOME=/usr/lib/jvm/java-${java_version}-amazon-corretto
+ExecStart=$${NIFI_HOME}/bin/nifi.sh start
+ExecStop=$${NIFI_HOME}/bin/nifi.sh stop
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now nifi
+echo "NiFi bootstrap complete"
