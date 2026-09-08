@@ -1,0 +1,38 @@
+region             = "us-east-1"
+name               = "keycloak-dev"
+instance_subnet_id = "subnet-0aaa111122223333a"          # private
+lb_subnet_ids      = ["subnet-0aaa111122223333a", "subnet-0bbb111122223333b"] # private, 2 AZs
+allowed_cidr_blocks = ["10.0.0.0/8"]
+
+# HTTPS on the internal ALB (omit for HTTP :80)
+certificate_arn   = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+keycloak_hostname = "sso.dev.internal.example.com"
+
+keycloak_image          = "quay.io/keycloak/keycloak:26.3"
+keycloak_admin_password = "ChangeMePlease123!"
+
+# External Postgres (recommended); drop these to use the embedded dev store
+db_url      = "jdbc:postgresql://keycloak-db.dev.internal:5432/keycloak"
+db_username = "keycloak"
+db_password = "db-password-goes-here"
+
+# Any KC_* option
+keycloak_env = {
+  KC_LOG_LEVEL           = "info"
+  KC_HTTP_RELATIVE_PATH  = "/"
+  KC_CACHE               = "local"
+  KC_HOSTNAME_STRICT     = "true"
+}
+
+# Extra keycloak.conf entries (spi-*, etc.)
+keycloak_user_properties = {
+  "spi-theme-cache-themes"    = "true"
+  "spi-events-listener-jboss-logging-success-level" = "info"
+}
+
+keycloak_extra_args = ["--features=token-exchange,admin-fine-grained-authz"]
+
+tags = {
+  Environment = "dev"
+  Owner       = "platform"
+}

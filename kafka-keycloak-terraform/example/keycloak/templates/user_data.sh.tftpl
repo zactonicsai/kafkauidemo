@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+###############################################################################
+# Keycloak bootstrap (rendered by Terraform templatefile())
+#
+#  1. Install Docker (Amazon Linux 2023)
+#  2. Write /etc/keycloak/keycloak.env from `keycloak_env` (KC_* settings)
+#  3. Run ${image} as a systemd-managed container behind the internal ALB
+###############################################################################
+set -euo pipefail
+exec > >(tee -a /var/log/keycloak-bootstrap.log) 2>&1
+
+# --- 1. Docker ----------------------------------------------------------------
+dnf install -y docker
+systemctl enable --now docker
+
+# --- 2. Configuration ----------------------------------------------------------
+mkdir -p /etc/keycloak /var/lib/keycloak/data
+chmod 750 /etc/keycloak
+
+cat > /etc/keycloak/keycloak.env <<'EOF'
+# Managed by Terraform – Keycloak environment (KC_* options)
+%{ for k, v in keycloak_env ~}
+${k}=${v}
+%{ endfor ~}
+# --- credentials / secrets ---
+KC_BOOTSTRAP_ADMIN_USERNAME=${admin_username}
+KC_BOOTSTRAP_ADMIN_PASSWORD=${admin_password}
+%{ if db_password != "" ~}
+KC_DB_PASSWORD=${db_password}
+%{ endif ~}
+EOF
+chmod 640 /etc/keycloak/keycloak.env
+
+%{ if length(user_properties) > 0 ~}
+# Extra user-defined properties (mounted as conf/keycloak.conf inside the container)
+cat > /etc/keycloak/keycloak.conf <<'EOF'
+# Managed by Terraform – custom keycloak.conf entries
+%{ for k, v in user_properties ~}
+${k}=${v}
+%{ endfor ~}
+EOF
+chmod 640 /etc/keycloak/keycloak.conf
+%{ endif ~}
+
+# --- 3. systemd unit -----------------------------------------------------------
+cat > /etc/systemd/system/keycloak.service <<'EOF'
+[Unit]
+Description=Keycloak (Docker)
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=10
+TimeoutStartSec=0
+ExecStartPre=-/usr/bin/docker stop keycloak
+ExecStartPre=-/usr/bin/docker rm keycloak
+ExecStartPre=/usr/bin/docker pull ${image}
+ExecStart=/usr/bin/docker run --rm --name keycloak \
+  --env-file /etc/keycloak/keycloak.env \
+  -p ${http_port}:8080 \
+  -p ${management_port}:9000 \
+  -v /var/lib/keycloak/data:/opt/keycloak/data \
+%{ if length(user_properties) > 0 ~}
+  -v /etc/keycloak/keycloak.conf:/opt/keycloak/conf/keycloak.conf:ro \
+%{ endif ~}
+  --log-driver=journald \
+  ${image} start ${join(" ", extra_args)}
+ExecStop=/usr/bin/docker stop keycloak
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now keycloak
+echo "Keycloak bootstrap complete"
